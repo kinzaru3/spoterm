@@ -15,17 +15,10 @@ impl Config {
             .context("SPOTERM_CLIENT_ID が未設定です（.env を確認してください）")?;
         let redirect_uri = std::env::var("SPOTERM_REDIRECT_URI")
             .unwrap_or_else(|_| "http://127.0.0.1:8888/callback".to_string());
-        Ok(Self { client_id, redirect_uri })
-    }
-
-    /// ログ表示用に client_id を伏せる。
-    pub fn masked_client_id(&self) -> String {
-        let id = &self.client_id;
-        if id.len() <= 6 {
-            "*".repeat(id.len())
-        } else {
-            format!("{}…{}", &id[..4], &id[id.len() - 2..])
-        }
+        Ok(Self {
+            client_id,
+            redirect_uri,
+        })
     }
 }
 

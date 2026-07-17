@@ -1,3 +1,4 @@
+mod auth;
 mod cli;
 mod config;
 
@@ -7,17 +8,14 @@ use clap::Parser;
 use cli::{Cli, Command, DeviceAction, PlaylistAction};
 use config::Config;
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
         Command::Login => {
-            // 設定ローダの疎通確認を兼ねる（本実装は Phase 2）。
             let cfg = Config::load()?;
-            println!("PKCE ログインを行います（Phase 2 で実装）");
-            println!("  client_id   : {}", cfg.masked_client_id());
-            println!("  redirect_uri: {}", cfg.redirect_uri);
-            println!("  config_dir  : {}", config::config_dir()?.display());
+            auth::login(&cfg).await?;
         }
         Command::Status => todo_cmd("status", 3),
         Command::Search { query } => todo_cmd(&format!("search '{}'", query.join(" ")), 3),
