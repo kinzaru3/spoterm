@@ -1,0 +1,26 @@
+services:
+  dev:
+    build:
+      context: .
+    image: spoterm-dev
+    container_name: spoterm-dev
+    working_dir: /workspace
+    volumes:
+      # プロジェクトソース（ホストと共有）
+      - ./:/workspace
+      # cargo キャッシュ & ビルド成果物を volume 化（再ビルド高速化・ホスト非汚染）
+      - cargo-registry:/usr/local/cargo/registry
+      - target-cache:/workspace/target
+    ports:
+      # PKCE の OAuth redirect をホストブラウザから転送
+      - "127.0.0.1:8888:8888"
+    env_file:
+      - path: .env
+        required: false
+    tty: true
+    stdin_open: true
+    command: sleep infinity
+
+volumes:
+  cargo-registry:
+  target-cache:
