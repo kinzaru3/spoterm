@@ -14,38 +14,22 @@ use config::Config;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // 全コマンドが設定（client_id 等）を必要とするため、一度だけ読み込む。
+    let cfg = Config::load()?;
+
     match cli.command {
-        Command::Login => {
-            let cfg = Config::load()?;
-            auth::login(&cfg).await?;
-        }
-        Command::Status => {
-            let cfg = Config::load()?;
-            commands::status::run(&cfg).await?;
-        }
-        Command::Search { query } => {
-            let cfg = Config::load()?;
-            commands::search::run(&cfg, &query).await?;
-        }
-        Command::Play { query } => {
-            let what = if query.is_empty() {
-                "play (再開)".to_string()
-            } else {
-                format!("play '{}'", query.join(" "))
-            };
-            todo_cmd(&what, 4);
-        }
-        Command::Pause => todo_cmd("pause", 4),
-        Command::Next => todo_cmd("next", 4),
-        Command::Prev => todo_cmd("prev", 4),
-        Command::Toggle => todo_cmd("toggle", 4),
-        Command::Vol { level } => todo_cmd(&format!("vol {level}"), 4),
-        Command::Devices => {
-            let cfg = Config::load()?;
-            commands::devices::run(&cfg).await?;
-        }
+        Command::Login => auth::login(&cfg).await?,
+        Command::Status => commands::status::run(&cfg).await?,
+        Command::Search { query } => commands::search::run(&cfg, &query).await?,
+        Command::Play { query } => commands::playback::play(&cfg, &query).await?,
+        Command::Pause => commands::playback::pause(&cfg).await?,
+        Command::Next => commands::playback::next(&cfg).await?,
+        Command::Prev => commands::playback::prev(&cfg).await?,
+        Command::Toggle => commands::playback::toggle(&cfg).await?,
+        Command::Vol { level } => commands::playback::vol(&cfg, level).await?,
+        Command::Devices => commands::devices::run(&cfg).await?,
         Command::Device { action } => match action {
-            DeviceAction::Use { name } => todo_cmd(&format!("device use '{}'", name.join(" ")), 4),
+            DeviceAction::Use { name } => commands::device::run(&cfg, &name).await?,
         },
         Command::Playlist { action } => match action {
             PlaylistAction::Ls => todo_cmd("playlist ls", 5),

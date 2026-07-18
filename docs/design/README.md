@@ -12,6 +12,13 @@
 | [search.md](./search.md) | `spoterm search <query>` | track/album/artist を検索して一覧表示 |
 | [devices.md](./devices.md) | `spoterm devices` | 利用可能デバイス一覧（spotifyd が見えるかの実地検証を含む） |
 
+## Phase 4 — 再生コントロール
+
+| 文書 | 対象 | 概要 |
+| --- | --- | --- |
+| [playback.md](./playback.md) | `play`/`pause`/`next`/`prev`/`toggle`/`vol` | アクティブデバイスへの再生操作 |
+| [device-use.md](./device-use.md) | `spoterm device use <name>` | 指定デバイス（spotifyd 等）へ再生をトランスファー |
+
 ## 共通方針
 
 - **純粋関数を分離してテストする**: API 応答（rspotify のモデル型）を組み立てるのはテストで扱いにくいため、
