@@ -5,13 +5,10 @@ use anyhow::{Context, Result};
 use rspotify::model::{PlayableId, SearchResult, SearchType};
 use rspotify::prelude::*;
 
+use super::NEED_DEVICE_HINT;
 use crate::auth;
 use crate::config::Config;
 use crate::format::join_artists;
-
-/// アクティブデバイスが必要なコマンドで失敗時に添えるヒント。
-const NEED_DEVICE_HINT: &str =
-    "（アクティブなデバイスが必要です。`spoterm device use <name>` で選択してください）";
 
 pub async fn pause(cfg: &Config) -> Result<()> {
     let spotify = auth::authed_client(cfg).await?;

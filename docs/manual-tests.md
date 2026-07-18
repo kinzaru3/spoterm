@@ -48,6 +48,28 @@ cargo run -q -- play                            # （無引数）再開
 - `play <query>` で該当曲が再生され、`status` に `▶ 再生中` と曲情報が出る。
 - `vol` の値が `status` / `devices` の `vol` に反映される。
 
+## Phase 5 — プレイリスト & ライブラリ
+
+`lib` は読み取り専用（音は鳴らない）。`playlist play` は再生を開始する（音が鳴る）。
+
+```bash
+cargo run -q -- playlist ls                 # プレイリスト一覧（曲数・URI）。50件超なら総数注記
+cargo run -q -- lib                         # 保存済みトラック/アルバム一覧（各先頭20件）
+cargo run -q -- device use MacBook-spotifyd # 再生の前にデバイスをアクティブ化
+cargo run -q -- vol 25                       # 音量を下げてから
+cargo run -q -- playlist play <名前の一部>   # 名前照合して再生（部分一致可）
+cargo run -q -- status                       # ▶ 再生中 とプレイリストの曲情報が出る
+```
+
+期待:
+- `playlist ls`：`  1. <名前>  —  <n>曲    spotify:playlist:...` 形式。0 件なら「プレイリストがありません」。
+- `playlist play`：
+  - 一意に一致 → `▶ 再生: <名前>`。アクティブデバイスが無いと失敗し `device use` を促すヒントが出る。
+  - 部分一致が複数 → 候補名を列挙（`Ambiguous`）。
+  - 該当なし → 案内文（先頭 50 件しか見ていない場合はその旨も付く）。
+- `lib`：`🎵 保存済みトラック` / `💿 保存済みアルバム` の 2 セクション。両方 0 件なら一括メッセージ。
+  取得上限（各 20 件）を超える場合は見出しに `（先頭 20 件 / 全 M 件）` が付く。
+
 ## 既知の挙動・注意
 
 - **`status` の曲情報**: Spotify の `/me/player` はトラックに `external_ids` を含めず、rspotify 0.16.1 の

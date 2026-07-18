@@ -28,6 +28,21 @@ pub fn truncate(s: &str, max: usize) -> String {
     format!("{head}…")
 }
 
+/// 一覧の 1 行を整形する純粋関数。`subtitle` が空なら省略し、`uri` が空なら末尾に付けない。
+/// search / playlist ls / lib の各一覧で共用する。
+pub fn render_entry(index: usize, title: &str, subtitle: &str, uri: &str) -> String {
+    let head = if subtitle.is_empty() {
+        format!("  {index}. {title}")
+    } else {
+        format!("  {index}. {title}  —  {subtitle}")
+    };
+    if uri.is_empty() {
+        head
+    } else {
+        format!("{head}    {uri}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,5 +71,23 @@ mod tests {
         // マルチバイト（各文字 1 count）
         assert_eq!(truncate("あいうえお", 3), "あい…");
         assert_eq!(truncate("あいうえお", 5), "あいうえお");
+    }
+
+    #[test]
+    fn render_entry_with_subtitle_and_uri() {
+        let out = render_entry(1, "Song", "Artist", "spotify:track:abc");
+        assert_eq!(out, "  1. Song  —  Artist    spotify:track:abc");
+    }
+
+    #[test]
+    fn render_entry_without_subtitle() {
+        let out = render_entry(2, "Artist", "", "spotify:artist:xyz");
+        assert_eq!(out, "  2. Artist    spotify:artist:xyz");
+    }
+
+    #[test]
+    fn render_entry_without_uri() {
+        let out = render_entry(3, "My Mix", "120曲", "");
+        assert_eq!(out, "  3. My Mix  —  120曲");
     }
 }

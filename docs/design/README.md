@@ -19,6 +19,19 @@
 | [playback.md](./playback.md) | `play`/`pause`/`next`/`prev`/`toggle`/`vol` | アクティブデバイスへの再生操作 |
 | [device-use.md](./device-use.md) | `spoterm device use <name>` | 指定デバイス（spotifyd 等）へ再生をトランスファー |
 
+## Phase 5 — プレイリスト & ライブラリ
+
+| 文書 | 対象 | 概要 |
+| --- | --- | --- |
+| [playlist.md](./playlist.md) | `spoterm playlist ls\|play` | プレイリスト一覧・名前指定で再生 |
+| [lib.md](./lib.md) | `spoterm lib` | 保存済みトラック/アルバム一覧（読み取り専用） |
+
+## 共通ヘルパ
+
+| 文書 | 対象 | 概要 |
+| --- | --- | --- |
+| [match-name.md](./match-name.md) | `match_name`（`src/match_name.rs`） | 名前照合（完全一致優先→部分一致）。`device use` / `playlist play` で共用 |
+
 ## 共通方針
 
 - **純粋関数を分離してテストする**: API 応答（rspotify のモデル型）を組み立てるのはテストで扱いにくいため、
