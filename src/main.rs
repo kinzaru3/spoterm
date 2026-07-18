@@ -3,6 +3,7 @@ mod cli;
 mod commands;
 mod config;
 mod format;
+mod match_name;
 
 use anyhow::Result;
 use clap::Parser;
@@ -32,18 +33,11 @@ async fn main() -> Result<()> {
             DeviceAction::Use { name } => commands::device::run(&cfg, &name).await?,
         },
         Command::Playlist { action } => match action {
-            PlaylistAction::Ls => todo_cmd("playlist ls", 5),
-            PlaylistAction::Play { name } => {
-                todo_cmd(&format!("playlist play '{}'", name.join(" ")), 5)
-            }
+            PlaylistAction::Ls => commands::playlist::ls(&cfg).await?,
+            PlaylistAction::Play { name } => commands::playlist::play(&cfg, &name).await?,
         },
-        Command::Lib => todo_cmd("lib", 5),
+        Command::Lib => commands::lib::run(&cfg).await?,
     }
 
     Ok(())
-}
-
-/// 未実装コマンドのプレースホルダ。どのフェーズで実装予定かを示す。
-fn todo_cmd(name: &str, phase: u8) {
-    println!("`{name}` は未実装です（Phase {phase} で実装予定）");
 }

@@ -6,7 +6,7 @@ use rspotify::prelude::*;
 
 use crate::auth;
 use crate::config::Config;
-use crate::format::{join_artists, truncate};
+use crate::format::{join_artists, render_entry, truncate};
 
 /// 各種別の取得件数（2026-02 以降 API 上限 10・既定 5。控えめに 5）。
 const SEARCH_LIMIT: u32 = 5;
@@ -41,7 +41,7 @@ pub async fn run(cfg: &Config, query: &[String]) -> Result<()> {
             let uri = t.id.as_ref().map(|id| id.uri()).unwrap_or_default();
             println!(
                 "{}",
-                render_line(
+                render_entry(
                     i + 1,
                     &truncate(&t.name, NAME_WIDTH),
                     &join_artists(&artists),
@@ -61,7 +61,7 @@ pub async fn run(cfg: &Config, query: &[String]) -> Result<()> {
             let uri = a.id.as_ref().map(|id| id.uri()).unwrap_or_default();
             println!(
                 "{}",
-                render_line(
+                render_entry(
                     i + 1,
                     &truncate(&a.name, NAME_WIDTH),
                     &join_artists(&artists),
@@ -80,7 +80,7 @@ pub async fn run(cfg: &Config, query: &[String]) -> Result<()> {
             let uri = a.id.uri();
             println!(
                 "{}",
-                render_line(i + 1, &truncate(&a.name, NAME_WIDTH), "", &uri)
+                render_entry(i + 1, &truncate(&a.name, NAME_WIDTH), "", &uri)
             );
         }
     }
@@ -90,30 +90,4 @@ pub async fn run(cfg: &Config, query: &[String]) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// 検索結果 1 行を整形する純粋関数。`subtitle` が空なら省略する。
-fn render_line(index: usize, title: &str, subtitle: &str, uri: &str) -> String {
-    if subtitle.is_empty() {
-        format!("  {index}. {title}    {uri}")
-    } else {
-        format!("  {index}. {title}  —  {subtitle}    {uri}")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn render_line_with_subtitle() {
-        let out = render_line(1, "Song", "Artist", "spotify:track:abc");
-        assert_eq!(out, "  1. Song  —  Artist    spotify:track:abc");
-    }
-
-    #[test]
-    fn render_line_without_subtitle() {
-        let out = render_line(2, "Artist", "", "spotify:artist:xyz");
-        assert_eq!(out, "  2. Artist    spotify:artist:xyz");
-    }
 }

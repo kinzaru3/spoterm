@@ -124,8 +124,17 @@ spoterm lib               # 保存済みトラック/アルバム一覧・再生
     失敗し `PlayableItem::Unknown` に落ちる。生 JSON から表示値を取り出すフォールバックを追加（`track_from_json`）。
   - **既知の制約**: `toggle` の短時間連続実行は Connect の状態伝播遅延で誤判定し得る（[manual-tests.md](./manual-tests.md) 参照）。
 
-### Phase 5 — プレイリスト & ライブラリ
-- [ ] `playlist ls|play` / `lib`（保存済みトラック・アルバム）
+### Phase 5 — プレイリスト & ライブラリ ✅
+詳細設計は [design/playlist.md](./design/playlist.md) / [design/lib.md](./design/lib.md) / [design/match-name.md](./design/match-name.md)。
+- [x] `playlist ls`：プレイリスト一覧（曲数・URI・先頭50件、超過時は総数注記）
+- [x] `playlist play <name>`：名前照合して `start_context_playback` で再生（アクティブデバイス対象）
+- [x] `lib`：保存済みトラック・アルバム一覧（各先頭20件、超過時は見出しに内訳）
+- [x] リファクタ：名前照合を共通ヘルパ `src/match_name.rs`（`device use` と共用）へ抽出、
+      一覧整形を `format::render_entry`（search / playlist / lib で共用）へ集約
+- [x] `fmt`/`clippy -D warnings` 通過、単体テスト 33 件、ECC rust-reviewer 反映
+      （`pl.id` の不要 clone を借用化・`NEED_DEVICE_HINT` を `commands/mod.rs` に集約・
+      `page.items` の move を借用化・該当なし文言を純粋関数 `no_match_message` に抽出しテスト追加）
+- [ ] 実 API 動作確認（[manual-tests.md](./manual-tests.md) の Phase 5 手順）— **ユーザー実機で実施予定**
 
 ### Phase 6 — TUI 化
 - [ ] `ratatui` で Now Playing 画面・検索・選曲・キー操作
@@ -149,5 +158,5 @@ spoterm lib               # 保存済みトラック/アルバム一覧・再生
     `transfer_playback` で実装できる見込み。
 
 ## 次の一手
-Phase 3（読み取り系コマンド）を実装する。`auth::authed_client` → `devices` → `status`/`search` の順に
-TDD で進め、`devices` で spotifyd の可視性を実地確認する。
+Phase 5 は実装・自動テスト完了。残りはユーザー実機での実 API 動作確認
+（[manual-tests.md](./manual-tests.md) の Phase 5 手順）。確認後、Phase 6（TUI 化）に着手する。
