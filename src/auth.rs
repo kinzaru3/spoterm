@@ -56,6 +56,28 @@ pub fn build_client(cfg: &Config) -> Result<AuthCodePkceSpotify> {
     Ok(AuthCodePkceSpotify::with_config(creds, oauth, rconf))
 }
 
+/// キャッシュ済みトークンを読み込んだ認証済みクライアントを返す。
+/// Phase 3 以降の API コマンド（status/search/devices/…）の共通入口。
+/// 期限切れトークンでも読み込み（`allow_expired`）、以降の API 呼び出しで
+/// `token_refreshing`（既定 true）により自動リフレッシュされる。
+pub async fn authed_client(cfg: &Config) -> Result<AuthCodePkceSpotify> {
+    let spotify = build_client(cfg)?;
+
+    let token = spotify
+        .read_token_cache(true)
+        .await
+        .context("トークンキャッシュの読み込みに失敗しました")?
+        .context("未ログインです。先に `spoterm login` を実行してください")?;
+
+    // 読み込んだトークンをクライアントに設定する。
+    let token_mutex = spotify.get_token();
+    let mut guard = token_mutex.lock().await.unwrap();
+    *guard = Some(token);
+    drop(guard);
+
+    Ok(spotify)
+}
+
 /// `spoterm login`: ブラウザで認可 → ローカルサーバで redirect を受け取り → トークンを取得・保存。
 pub async fn login(cfg: &Config) -> Result<()> {
     let mut spotify = build_client(cfg)?;

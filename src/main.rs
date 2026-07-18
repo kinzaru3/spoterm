@@ -1,6 +1,8 @@
 mod auth;
 mod cli;
+mod commands;
 mod config;
+mod format;
 
 use anyhow::Result;
 use clap::Parser;
@@ -17,8 +19,14 @@ async fn main() -> Result<()> {
             let cfg = Config::load()?;
             auth::login(&cfg).await?;
         }
-        Command::Status => todo_cmd("status", 3),
-        Command::Search { query } => todo_cmd(&format!("search '{}'", query.join(" ")), 3),
+        Command::Status => {
+            let cfg = Config::load()?;
+            commands::status::run(&cfg).await?;
+        }
+        Command::Search { query } => {
+            let cfg = Config::load()?;
+            commands::search::run(&cfg, &query).await?;
+        }
         Command::Play { query } => {
             let what = if query.is_empty() {
                 "play (再開)".to_string()
@@ -32,7 +40,10 @@ async fn main() -> Result<()> {
         Command::Prev => todo_cmd("prev", 4),
         Command::Toggle => todo_cmd("toggle", 4),
         Command::Vol { level } => todo_cmd(&format!("vol {level}"), 4),
-        Command::Devices => todo_cmd("devices", 3),
+        Command::Devices => {
+            let cfg = Config::load()?;
+            commands::devices::run(&cfg).await?;
+        }
         Command::Device { action } => match action {
             DeviceAction::Use { name } => todo_cmd(&format!("device use '{}'", name.join(" ")), 4),
         },
