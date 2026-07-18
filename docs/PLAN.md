@@ -106,8 +106,13 @@ spoterm lib               # 保存済みトラック/アルバム一覧・再生
 - [x] セキュリティ強化（state 照合 / token.json 0600 / timeout・パス検証・上限読取）＋テスト10件
 - [x] 実地ログイン成功（rspotify 0.16.1・PKCE・rustls）
 
-### Phase 3 — 読み取り系コマンド（Premium 無関係で安全）
-- [ ] `status` / `search` / `devices`
+### Phase 3 — 読み取り系コマンド（Premium 無関係で安全）✅
+副作用のない読み取り専用コマンド。詳細設計は [docs/design/](./design/README.md) を参照。
+- [x] `auth::authed_client`：キャッシュ済みトークンを読む認証済みクライアント共通ヘルパ（[設計](./design/auth-client.md)）
+- [x] `status`：Now Playing 表示（[設計](./design/status.md)）
+- [x] `search`：track/album/artist 検索（[設計](./design/search.md)）
+- [x] `devices`：デバイス一覧（[設計](./design/devices.md)）＋ spotifyd が Web API に見えるか実地検証（**可視を確認**）
+- [x] 整形の純粋関数（`src/format.rs`）に単体テスト、`fmt`/`clippy -D warnings` 通過、実 API 疎通確認
 
 ### Phase 4 — 再生コントロール
 - [ ] `play` / `pause` / `next` / `prev` / `toggle` / `vol`
@@ -123,5 +128,20 @@ spoterm lib               # 保存済みトラック/アルバム一覧・再生
 - [ ] `wiremock` で API モックの単体テスト、CI（GitHub Actions）
 - [ ] リリースバイナリ（GitHub Releases）、`cargo install`、将来的に Homebrew tap
 
+## 追加要望・設計メモ（随時追記）
+
+実装中に判明した方針変更や、当初プランへの追加要望をここに集約する。
+
+- **詳細設計書を `docs/design/` に機能単位で作成**（Phase 3 から運用）。実装前に設計 → 実装差分は同文書へ反映。
+- **表示整形は純粋関数に分離**：rspotify モデルはテストで組み立てにくいため、整形は
+  プリミティブ入出力の純粋関数（`src/format.rs` 他）に切り出して単体テストする。
+- **空状態を必ず明示**：再生なし / ヒット 0 / デバイス 0 は黙らずメッセージを出す（silent failure 禁止）。
+- **spotifyd 可視性（Phase 3 devices で検証済み ✅）**：discovery(zeroconf) の spotifyd が Web API の
+  devices 一覧に出るか未確定だった件。詳細は [design/devices.md](./design/devices.md)。
+  - 検証結果（2026-07-18）: `MacBook-spotifyd` は **一覧に出た**。discovery 方式のままで可視で、
+    公式アプリでの事前アクティブ化や OAuth 方式への切替は不要。Phase 4 の `device use` はこの id への
+    `transfer_playback` で実装できる見込み。
+
 ## 次の一手
-Phase 0 の環境セットアップから着手する（Rust 導入 → Redirect URI 追加 → spotifyd 起動確認）。
+Phase 3（読み取り系コマンド）を実装する。`auth::authed_client` → `devices` → `status`/`search` の順に
+TDD で進め、`devices` で spotifyd の可視性を実地確認する。
