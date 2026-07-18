@@ -114,12 +114,15 @@ spoterm lib               # 保存済みトラック/アルバム一覧・再生
 - [x] `devices`：デバイス一覧（[設計](./design/devices.md)）＋ spotifyd が Web API に見えるか実地検証（**可視を確認**）
 - [x] 整形の純粋関数（`src/format.rs`）に単体テスト、`fmt`/`clippy -D warnings` 通過、実 API 疎通確認
 
-### Phase 4 — 再生コントロール ✅（実装・レビュー済み / 実 API 再生テストは実施待ち）
-詳細設計は [design/playback.md](./design/playback.md) / [design/device-use.md](./design/device-use.md)。
+### Phase 4 — 再生コントロール ✅
+詳細設計は [design/playback.md](./design/playback.md) / [design/device-use.md](./design/device-use.md)。手順は [manual-tests.md](./manual-tests.md)。
 - [x] `play`（無引数=再開 / クエリ=検索して再生）/ `pause` / `next` / `prev` / `toggle` / `vol`
 - [x] `device use` で spotifyd へトランスファー（`match_device` の名前照合を単体テスト）
-- [x] `fmt`/`clippy -D warnings` 通過、単体テスト 26 件、ECC rust-reviewer 反映（clone 除去・空クエリ/空列ガード・`Config::load` 巻き上げ）
-- [ ] 実 API の再生テスト（音が出るためユーザー許可のうえ実施）: `device use` → `play` → `status`/`vol`/`pause`
+- [x] `fmt`/`clippy -D warnings` 通過、単体テスト 28 件、ECC rust-reviewer 反映（clone 除去・空クエリ/空列ガード・`Config::load` 巻き上げ）
+- [x] 実 API の再生テスト実施（`device use`→`play`→`status`/`next`/`prev`/`vol`/`pause` すべて動作確認）
+  - **`status` バグ修正**: `/me/player` はトラックに `external_ids` を返さず rspotify の `FullTrack` 解析が
+    失敗し `PlayableItem::Unknown` に落ちる。生 JSON から表示値を取り出すフォールバックを追加（`track_from_json`）。
+  - **既知の制約**: `toggle` の短時間連続実行は Connect の状態伝播遅延で誤判定し得る（[manual-tests.md](./manual-tests.md) 参照）。
 
 ### Phase 5 — プレイリスト & ライブラリ
 - [ ] `playlist ls|play` / `lib`（保存済みトラック・アルバム）

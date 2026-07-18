@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use rspotify::model::PlayableItem;
 use rspotify::prelude::*;
+use serde_json::Value;
 
 use crate::auth;
 use crate::config::Config;
@@ -54,10 +55,52 @@ pub async fn run(cfg: &Config) -> Result<()> {
             );
             println!("{line}");
         }
-        _ => println!("再生中ですが、曲情報を取得できませんでした"),
+        // Spotify の /me/player はトラックに external_ids を返さず、rspotify の FullTrack 解析が
+        // 失敗して Unknown(生JSON) に落ちる。生 JSON から必要な値を取り出してフォールバック表示する。
+        Some(PlayableItem::Unknown(v)) => {
+            let (title, artists, album, duration_ms) = track_from_json(&v);
+            let line = render_track(
+                ctx.is_playing,
+                &title,
+                &join_artists(&artists),
+                album.as_deref(),
+                progress_ms,
+                duration_ms,
+                &device,
+                vol,
+            );
+            println!("{line}");
+        }
+        None => println!("再生中ですが、曲情報を取得できませんでした（広告などの可能性）"),
     }
 
     Ok(())
+}
+
+/// `/me/player` のトラック JSON（rspotify が Unknown に落としたもの）から
+/// 表示に必要な (曲名, アーティスト名, アルバム名, 再生時間ms) を取り出す。
+fn track_from_json(v: &Value) -> (String, Vec<String>, Option<String>, u128) {
+    let title = v
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("(不明なタイトル)")
+        .to_string();
+    let artists = v
+        .get("artists")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| a.get("name").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let album = v
+        .get("album")
+        .and_then(|a| a.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let duration_ms = v.get("duration_ms").and_then(Value::as_u64).unwrap_or(0) as u128;
+    (title, artists, album, duration_ms)
 }
 
 /// 再生状況の表示ブロックを組み立てる純粋関数。API 応答からの写像は呼び出し側で行う。
@@ -128,5 +171,30 @@ mod tests {
         assert!(out.contains("(vol -)"));
         // アルバム行は出さない
         assert!(!out.contains("アルバム"));
+    }
+
+    #[test]
+    fn track_from_json_extracts_fields() {
+        let v = serde_json::json!({
+            "name": "Get Lucky",
+            "artists": [{"name": "Daft Punk"}, {"name": "Pharrell Williams"}],
+            "album": {"name": "Random Access Memories"},
+            "duration_ms": 248_000
+        });
+        let (title, artists, album, dur) = track_from_json(&v);
+        assert_eq!(title, "Get Lucky");
+        assert_eq!(artists, vec!["Daft Punk", "Pharrell Williams"]);
+        assert_eq!(album.as_deref(), Some("Random Access Memories"));
+        assert_eq!(dur, 248_000);
+    }
+
+    #[test]
+    fn track_from_json_falls_back_on_missing_fields() {
+        let v = serde_json::json!({});
+        let (title, artists, album, dur) = track_from_json(&v);
+        assert_eq!(title, "(不明なタイトル)");
+        assert!(artists.is_empty());
+        assert_eq!(album, None);
+        assert_eq!(dur, 0);
     }
 }
