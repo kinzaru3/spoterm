@@ -100,9 +100,11 @@ spoterm lib               # 保存済みトラック/アルバム一覧・再生
       client_id はマスク表示、XDG 設定ディレクトリ）
 - [x] `cargo build` / `--help` / `login`(config疎通) / `vol` 範囲(0-100) / clippy 警告0 を検証
 
-### Phase 2 — 認証（PKCE）
-- [ ] `spoterm login`：ブラウザ起動 → ローカルサーバで redirect を捕捉 → トークンキャッシュ
-- [ ] トークン自動リフレッシュ
+### Phase 2 — 認証（PKCE）✅
+- [x] `spoterm login`：認可URL → ローカル 8888 で redirect 捕捉 → トークン取得・キャッシュ（`src/auth.rs`）
+- [x] トークン自動リフレッシュ（`token_cached`＋refresh_token 取得済み。読み込みヘルパは Phase 3）
+- [x] セキュリティ強化（state 照合 / token.json 0600 / timeout・パス検証・上限読取）＋テスト10件
+- [x] 実地ログイン成功（rspotify 0.16.1・PKCE・rustls）
 
 ### Phase 3 — 読み取り系コマンド（Premium 無関係で安全）
 - [ ] `status` / `search` / `devices`

@@ -24,9 +24,7 @@ pub enum Command {
         query: Vec<String>,
     },
     /// 再生（クエリ指定で検索して再生、無指定で再開）
-    Play {
-        query: Vec<String>,
-    },
+    Play { query: Vec<String> },
     /// 一時停止
     Pause,
     /// 次の曲へ
