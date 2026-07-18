@@ -151,6 +151,11 @@ spoterm lib               # 保存済みトラック/アルバム一覧・再生
 - **表示整形は純粋関数に分離**：rspotify モデルはテストで組み立てにくいため、整形は
   プリミティブ入出力の純粋関数（`src/format.rs` 他）に切り出して単体テストする。
 - **空状態を必ず明示**：再生なし / ヒット 0 / デバイス 0 は黙らずメッセージを出す（silent failure 禁止）。
+- **トークンのリフレッシュは自前制御（rspotify の不具合回避）**：rspotify 0.16.1 は毎リクエスト前の
+  `auto_reauth` で `refetch_token → write_token_cache` を実行するが、Spotify の PKCE リフレッシュ応答が
+  `refresh_token` を省略すると `null` で上書き保存し、以降リフレッシュ不能になる（実機で発生・修正済み）。
+  対策として `token_refreshing=false` で自動更新を無効化し、`auth::authed_client` が期限切れ時のみ明示的に
+  更新して旧 `refresh_token` を保持（`preserve_refresh_token`）、`0600` で保存する（`restrict_token_perms`）。
 - **spotifyd 可視性（Phase 3 devices で検証済み ✅）**：discovery(zeroconf) の spotifyd が Web API の
   devices 一覧に出るか未確定だった件。詳細は [design/devices.md](./design/devices.md)。
   - 検証結果（2026-07-18）: `MacBook-spotifyd` は **一覧に出た**。discovery 方式のままで可視で、

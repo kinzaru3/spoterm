@@ -1,6 +1,8 @@
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use rspotify::model::Token;
 use rspotify::{
     AuthCodePkceSpotify, Config as RSpotifyConfig, Credentials, OAuth, prelude::*, scopes,
 };
@@ -32,7 +34,7 @@ pub fn build_client(cfg: &Config) -> Result<AuthCodePkceSpotify> {
         ..Default::default()
     };
 
-    let cache_path = config::config_dir()?.join(TOKEN_CACHE_FILE);
+    let cache_path = token_cache_path()?;
     if let Some(parent) = cache_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("設定ディレクトリの作成に失敗: {}", parent.display()))?;
@@ -49,6 +51,14 @@ pub fn build_client(cfg: &Config) -> Result<AuthCodePkceSpotify> {
 
     let rconf = RSpotifyConfig {
         token_cached: true,
+        // 自動リフレッシュは無効化し、authed_client で自前制御する。rspotify の自動更新は
+        // Spotify が refresh_token を省略した応答を返すと refresh_token を null で上書き
+        // 保存してしまい（毎リクエスト前の auto_reauth → write_token_cache）、以降リフレッシュ
+        // 不能になる不具合があるため。
+        // 注意: この結果リフレッシュ点は authed_client の入口 1 箇所のみになる。単発コマンドは
+        // 数リクエストで完結するため問題ないが、将来ページング等で長時間・多数リクエストを行う
+        // コマンドを追加する場合は、途中失効に備えた 401→再取得のリトライを別途用意すること。
+        token_refreshing: false,
         cache_path,
         ..Default::default()
     };
@@ -58,8 +68,8 @@ pub fn build_client(cfg: &Config) -> Result<AuthCodePkceSpotify> {
 
 /// キャッシュ済みトークンを読み込んだ認証済みクライアントを返す。
 /// Phase 3 以降の API コマンド（status/search/devices/…）の共通入口。
-/// 期限切れトークンでも読み込み（`allow_expired`）、以降の API 呼び出しで
-/// `token_refreshing`（既定 true）により自動リフレッシュされる。
+/// 期限切れなら自前でリフレッシュし、refresh_token を保持したままキャッシュを 0600 で更新する
+/// （rspotify の自動リフレッシュは refresh_token を失う不具合があるため無効化している）。
 pub async fn authed_client(cfg: &Config) -> Result<AuthCodePkceSpotify> {
     let spotify = build_client(cfg)?;
 
@@ -69,13 +79,108 @@ pub async fn authed_client(cfg: &Config) -> Result<AuthCodePkceSpotify> {
         .context("トークンキャッシュの読み込みに失敗しました")?
         .context("未ログインです。先に `spoterm login` を実行してください")?;
 
-    // 読み込んだトークンをクライアントに設定する。
-    let token_mutex = spotify.get_token();
-    let mut guard = token_mutex.lock().await.unwrap();
-    *guard = Some(token);
-    drop(guard);
+    let token = if token.is_expired() {
+        refresh_expired_token(&spotify, token).await?
+    } else {
+        token
+    };
+
+    // 読み込んだ（または更新した）トークンをクライアントに設定する。
+    set_client_token(&spotify, token).await;
 
     Ok(spotify)
+}
+
+/// 認証済みクライアントのトークンをロック経由で設定する。この CLI は単発実行でトークンロックを
+/// 他スレッドと共有しないため poison は起こらない（poison は先行 panic を意味する）。
+async fn set_client_token(spotify: &AuthCodePkceSpotify, token: Token) {
+    let token_mutex = spotify.get_token();
+    let mut guard = token_mutex
+        .lock()
+        .await
+        .expect("token mutex poisoned (implies a prior panic)");
+    *guard = Some(token);
+}
+
+/// 期限切れトークンを明示的に更新し、refresh_token を保持したままキャッシュへ 0600 で保存して返す。
+async fn refresh_expired_token(spotify: &AuthCodePkceSpotify, expired: Token) -> Result<Token> {
+    // 応答が refresh_token を省略した場合に備え、更新前の値を控える。
+    let previous_refresh_token = expired.refresh_token.clone();
+
+    // refetch_token は現在ロック中のトークンの refresh_token を使って更新するため、先に入れる。
+    set_client_token(spotify, expired).await;
+
+    let refreshed = spotify
+        .refetch_token()
+        .await
+        .context("トークンの更新に失敗しました")?
+        .context(
+            "refresh_token が無いため更新できません。`spoterm login` で再ログインしてください",
+        )?;
+
+    let token = preserve_refresh_token(refreshed, previous_refresh_token);
+    persist_token(&token)?;
+    Ok(token)
+}
+
+/// リフレッシュ応答が refresh_token を省略した場合、直前の refresh_token を引き継ぐ。
+/// Spotify の PKCE リフレッシュ応答は refresh_token を含まないことがあり、そのまま保存すると
+/// 以降リフレッシュ不能になるため。応答が新しい refresh_token を返した場合はそれを優先する。
+fn preserve_refresh_token(mut refreshed: Token, previous_refresh_token: Option<String>) -> Token {
+    if refreshed.refresh_token.is_none() {
+        refreshed.refresh_token = previous_refresh_token;
+    }
+    refreshed
+}
+
+/// トークンキャッシュのパス（設定ディレクトリ配下）を返す。
+fn token_cache_path() -> Result<PathBuf> {
+    Ok(config::config_dir()?.join(TOKEN_CACHE_FILE))
+}
+
+/// 更新済みトークンをキャッシュへ保存する（0600 で保護）。write_cache 前に 0600 で事前作成し、
+/// 新規作成時に umask 依存で一時的に他者可読になる窓を塞ぐ（write_cache は create+truncate で
+/// 既存 inode を再利用するため、権限は維持される）。既存ファイルが緩い権限だった場合に備え
+/// 書き込み後にも制限をかける。
+fn persist_token(token: &Token) -> Result<()> {
+    let cache = token_cache_path()?;
+    precreate_token_cache_secure(&cache)?;
+    token
+        .write_cache(&cache)
+        .with_context(|| format!("トークンキャッシュの保存に失敗: {}", cache.display()))?;
+    restrict_token_perms(&cache)
+}
+
+/// トークンキャッシュを 0600 で事前作成する（既存なら権限は変えず内容も保持）。平文の
+/// access/refresh トークンを書き込む直前に呼び、新規作成時の権限窓を塞ぐ。
+fn precreate_token_cache_secure(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // mode(0o600) は「新規作成時」のみ適用される（既存ファイルには影響しない）。append で開くのは
+        // truncate による既存トークンの消失を避けるため（何も書かずに閉じる）。
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("トークンキャッシュの作成に失敗: {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// トークンキャッシュを所有者のみ読み書き可（0600）に制限する。平文の access/refresh トークンを
+/// 含むため umask 依存にせず明示的に設定する。
+fn restrict_token_perms(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("トークンキャッシュの権限設定に失敗: {}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// `spoterm login`: ブラウザで認可 → ローカルサーバで redirect を受け取り → トークンを取得・保存。
@@ -97,20 +202,18 @@ pub async fn login(cfg: &Config) -> Result<()> {
         .await
         .context("リダイレクトの受信に失敗しました")?;
 
+    // request_token が書き出すキャッシュには access/refresh トークンが平文で入る。書き込み前に
+    // 0600 で事前作成し、rspotify の write_token_cache がこの inode を再利用するようにする。
+    let cache = token_cache_path()?;
+    precreate_token_cache_secure(&cache)?;
+
     spotify
         .request_token(&code)
         .await
         .context("アクセストークンの取得に失敗しました")?;
 
-    // request_token が書き出したキャッシュには access/refresh トークンが平文で入る。
-    // umask 依存にせず所有者のみ読み書き可に制限する。
-    let cache = config::config_dir()?.join(TOKEN_CACHE_FILE);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("トークンキャッシュの権限設定に失敗: {}", cache.display()))?;
-    }
+    // 念のため書き込み後にも権限を確定させる（既存ファイルが緩い権限だった場合の保険）。
+    restrict_token_perms(&cache)?;
 
     match spotify.current_user().await {
         Ok(user) => {
@@ -376,6 +479,49 @@ fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preserve_refresh_token_keeps_previous_when_response_omits_it() {
+        let refreshed = Token {
+            access_token: "new-access".into(),
+            refresh_token: None,
+            ..Default::default()
+        };
+
+        let merged = preserve_refresh_token(refreshed, Some("old-refresh".into()));
+
+        assert_eq!(merged.refresh_token.as_deref(), Some("old-refresh"));
+        assert_eq!(merged.access_token, "new-access");
+    }
+
+    #[test]
+    fn preserve_refresh_token_prefers_rotated_value() {
+        let refreshed = Token {
+            refresh_token: Some("rotated-refresh".into()),
+            ..Default::default()
+        };
+
+        let merged = preserve_refresh_token(refreshed, Some("old-refresh".into()));
+
+        assert_eq!(merged.refresh_token.as_deref(), Some("rotated-refresh"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restrict_token_perms_sets_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path =
+            std::env::temp_dir().join(format!("spoterm-perm-test-{}.json", std::process::id()));
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        restrict_token_perms(&path).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mode, 0o600);
+    }
 
     #[test]
     fn parses_port_from_redirect_uri() {
