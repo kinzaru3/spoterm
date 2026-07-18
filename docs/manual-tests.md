@@ -58,3 +58,12 @@ cargo run -q -- play                            # （無引数）再開
   通常の対話利用（数秒以上あけて実行）では問題ない。
 - **アクティブデバイス未選択**: 再生系コマンドは `device_id=None`（アクティブデバイス対象）で送る。
   アクティブデバイスが無いと Web API が 404 を返すため、先に `device use <name>` で選択する。
+- **spotifyd の音声出力先は起動時に固定される（重要）**: `spotifyd.conf` は `backend = "portaudio"` で
+  `device` 未指定のため、**spotifyd 起動時点の mac 既定出力デバイス**を掴んだまま常駐する。あとから
+  AirPods 等に出力先を切り替えても spotifyd は追従しない（Spotify 側では再生中に見えるのに音が
+  出ない、という症状になる）。
+  → **mac の出力先を切り替えたら spotifyd を再起動する**:
+  ```bash
+  brew services restart spotifyd   # AirPods を既定にした状態で実行
+  ```
+  実測でも、AirPods を既定出力にしてから spotifyd を再起動したところ AirPods から再生できた。
