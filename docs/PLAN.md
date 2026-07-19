@@ -198,11 +198,20 @@ spoterm lib               # 保存済みトラック/アルバム一覧・再生
       ECC rust-reviewer 反映（CRITICAL: スコープ追加、MEDIUM: 問い合わせ上限・cast 明示）
 - [ ] 実端末での実 API 動作確認（[manual-tests.md](./manual-tests.md) の Phase 6.4 手順・要再ログイン）— **ユーザー実機で実施予定**
 
-#### Phase 6.5 — UI 仕上げ & 内部改善
-- [ ] `?` ヘルプオーバーレイ（キー一覧）、フッターの簡略化
-- [ ] ワイド文字（絵文字/全角）の表示幅計算を `unicode-width` 等で厳密化（現状 char 数で近似）
-- [ ] ステータス行の一定時間後クリア、色/強調の調整
-- [ ] `authed_client` を毎ポーリング再構築している点を見直し（クライアント/トークンを `App` に保持し失効時のみ更新）
+#### Phase 6.5 — UI 仕上げ & 内部改善 ✅
+- [x] `?` ヘルプオーバーレイ（表示専用 `Mode::Help`・どのキーでも閉じる）でキー一覧を表示、フッターを
+      `? ヘルプ   q 終了` に簡略化。キー定義は純粋関数 `view::help_entries()` に一元化（フッター/ヘルプで共有）。
+- [x] ワイド文字（絵文字/全角）の表示幅を `unicode-width` で厳密化。`format::display_width` を追加し、
+      `truncate` を列幅ベースに書き換え（`…` 1 列ぶんを確保・全角の境界越えは手前で停止）。ratatui が
+      既に間接依存する版に統一（依存ツリー増なし）。
+- [x] ステータス行を `STATUS_TTL`（4 秒）で自動クリア（変化検知で計時）。種別を純粋関数 `view::status_kind`
+      で分類し `⚠`=赤 / 成功=緑 / それ以外=淡色で色分け。自動更新停止の案内は `poll_failures` から
+      `draw_now` が常時描画（自動クリアで消えない＝silent failure 回避）。
+- [x] `authed_client` の毎ポーリング再構築は **Phase 6.2 で対応済み**（`App` がクライアントを保持し
+      `auth::ensure_fresh_token` で失効時のみ更新）。本フェーズでは確認のみ。
+- [x] `fmt`/`clippy -D warnings`／`cargo test`（56 件・`display_width`/`help_entries`/`status_kind` 追加）・
+      ECC レビュー（rust-reviewer + silent-failure-hunter）反映
+- [ ] 実端末での実 API 動作確認（[manual-tests.md](./manual-tests.md) の Phase 6.5 手順）— **ユーザー実機で実施予定**
 
 > 各サブフェーズは独立した小さめの PR で進める想定。優先度・順序は要望に応じて入れ替え可。
 
@@ -230,6 +239,6 @@ spoterm lib               # 保存済みトラック/アルバム一覧・再生
     `transfer_playback` で実装できる見込み。
 
 ## 次の一手
-Phase 6.0〜6.3 は実装・自動テスト・実機確認まで完了。Phase 6.4（シーク & お気に入り）は実装・自動テスト・
-ECC レビューまで完了、残りは要再ログインでの実機確認（[manual-tests.md](./manual-tests.md) の Phase 6.4 手順）。
-確認後、Phase 6.5（UI 仕上げ & 内部改善）に着手する。
+Phase 6.0〜6.4 は実装・自動テスト・実機確認まで完了。Phase 6.5（UI 仕上げ & 内部改善）は実装・自動テスト・
+ECC レビュー（rust-reviewer + silent-failure-hunter）まで完了、残りは実機確認（[manual-tests.md](./manual-tests.md)
+の Phase 6.5 手順）。これで Phase 6（TUI 化）はほぼ完了。次は Phase 7（テスト & 配布：wiremock・CI・リリース）へ。
