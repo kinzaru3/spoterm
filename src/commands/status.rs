@@ -79,7 +79,8 @@ pub async fn run(cfg: &Config) -> Result<()> {
 
 /// `/me/player` のトラック JSON（rspotify が Unknown に落としたもの）から
 /// 表示に必要な (曲名, アーティスト名, アルバム名, 再生時間ms) を取り出す。
-fn track_from_json(v: &Value) -> (String, Vec<String>, Option<String>, u128) {
+/// TUI（`crate::tui`）でも同じフォールバックを使うため crate 内公開にしている。
+pub(crate) fn track_from_json(v: &Value) -> (String, Vec<String>, Option<String>, u128) {
     let title = v
         .get("name")
         .and_then(Value::as_str)

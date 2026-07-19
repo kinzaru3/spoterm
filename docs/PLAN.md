@@ -137,7 +137,48 @@ spoterm lib               # 保存済みトラック/アルバム一覧・再生
 - [ ] 実 API 動作確認（[manual-tests.md](./manual-tests.md) の Phase 5 手順）— **ユーザー実機で実施予定**
 
 ### Phase 6 — TUI 化
-- [ ] `ratatui` で Now Playing 画面・検索・選曲・キー操作
+「段階的」方針に沿い、まず Now Playing を出し（6.0）、以降サブフェーズで機能を足していく。
+各サブフェーズは「オーバーレイ/ビュー追加 → 既存 API・純粋関数を再利用 → 単体テスト → ECC レビュー → 実機確認」の流れで進める。
+
+#### Phase 6.0 — Now Playing ダッシュボード ✅
+- [x] `spoterm tui`：`ratatui` + `crossterm` で Now Playing をライブ表示（`src/tui/`）
+  - 曲名/アーティスト/アルバム/進捗ゲージ/デバイス/音量を表示。認証は既存 `auth::authed_client` を再利用。
+  - `POLL_INTERVAL=2s` で `current_playback` を再取得、合間は `view::interpolate_progress` でローカル補間。
+  - キー操作：`space`=トグル / `n`=次 / `p`=前 / `+`,`-`=音量±5 / `r`=更新 / `q`,`Esc`,`Ctrl-C`=終了。
+  - パニックフックで端末復元、API エラーはステータス行に出してループ継続（silent failure 禁止）。
+  - `Unknown` トラックのフォールバックは `status::track_from_json` を crate 内共有して再利用（DRY）。
+- [x] `fmt`/`clippy -D warnings` 通過、単体テスト 41 件（TUI 純粋関数 5 件追加）
+- [x] 実端末での実 API 動作確認（[manual-tests.md](./manual-tests.md) の Phase 6 手順）— **ユーザー実機で確認済み（2026-07-19）**
+
+#### Phase 6.1 — 検索して再生（Search overlay）
+- [ ] `/` で検索入力モード → クエリ入力 → `search`（Track）を叩いて結果リスト表示（既存 `search` API 再利用）
+- [ ] `↑`/`↓` で候補選択、`Enter` で `start_uris_playback` 再生、`Esc` で Now Playing へ戻る
+- [ ] 入力状態（IME/バックスペース/空クエリ）と 0 ヒット時のメッセージを整理（silent failure 禁止）
+- [ ] 選択・整形は純粋関数化して単体テスト（`render_result_row` 等）
+
+#### Phase 6.2 — ライブラリ / プレイリスト閲覧・再生（Browse view）
+- [ ] ビュー切替（例 `1`=Now / `2`=Library / `3`=Playlists、または `l`/`o`）でリスト画面へ
+- [ ] 保存済みトラック・アルバム（`lib`）とプレイリスト（`playlist ls`）を一覧、`Enter` で再生
+- [ ] スクロール/ページング（先頭 N 件超はスクロール、取得は既存コマンドの上限に合わせる）
+- [ ] 一覧整形は `format::render_entry` を流用、選択状態のハイライトを追加
+
+#### Phase 6.3 — デバイス選択（Device picker）
+- [ ] `d` でデバイス一覧オーバーレイ（`devices` 再利用）、`Enter` で `transfer_playback`（spotifyd 等へ）
+- [ ] アクティブデバイスの明示（`● (active)`）、転送後に即ポーリングして反映
+- [ ] アクティブ無し時の操作（再生/音量）の導線を改善
+
+#### Phase 6.4 — シーク & 現在曲のお気に入り（Seek + save）
+- [ ] `←`/`→` で 5〜10 秒シーク（`seek_track`）。進捗ゲージは補間ではなく即時反映
+- [ ] `s` で現在曲をライブラリに保存/解除（`save_tracks` / `current_user_saved_tracks_contains`）、状態を表示
+- [ ] 連続シークのデバウンス／Connect 状態伝播遅延への配慮
+
+#### Phase 6.5 — UI 仕上げ & 内部改善
+- [ ] `?` ヘルプオーバーレイ（キー一覧）、フッターの簡略化
+- [ ] ワイド文字（絵文字/全角）の表示幅計算を `unicode-width` 等で厳密化（現状 char 数で近似）
+- [ ] ステータス行の一定時間後クリア、色/強調の調整
+- [ ] `authed_client` を毎ポーリング再構築している点を見直し（クライアント/トークンを `App` に保持し失効時のみ更新）
+
+> 各サブフェーズは独立した小さめの PR で進める想定。優先度・順序は要望に応じて入れ替え可。
 
 ### Phase 7 — テスト & 配布
 - [ ] `wiremock` で API モックの単体テスト、CI（GitHub Actions）
@@ -163,5 +204,6 @@ spoterm lib               # 保存済みトラック/アルバム一覧・再生
     `transfer_playback` で実装できる見込み。
 
 ## 次の一手
-Phase 5 は実装・自動テスト完了。残りはユーザー実機での実 API 動作確認
-（[manual-tests.md](./manual-tests.md) の Phase 5 手順）。確認後、Phase 6（TUI 化）に着手する。
+Phase 6.0（Now Playing ダッシュボード）は実装・自動テスト・ユーザー実機確認まで完了（2026-07-19）。
+次は Phase 6.1（検索して再生）に着手する。以降 6.2〜6.5 をサブフェーズ単位の小さな PR で順次追加していく
+（優先度は要望に応じて調整可）。
