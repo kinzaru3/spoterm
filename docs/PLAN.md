@@ -186,10 +186,17 @@ spoterm lib               # 保存済みトラック/アルバム一覧・再生
 - [x] `fmt`/`clippy -D warnings`／`cargo test`（`device_row` 4 件追加、48 件）・ECC rust-reviewer 反映（0 CRITICAL/HIGH）
 - [x] 実端末での実 API 動作確認（[manual-tests.md](./manual-tests.md) の Phase 6.3 手順）— **ユーザー実機で確認済み（2026-07-19）**
 
-#### Phase 6.4 — シーク & 現在曲のお気に入り（Seek + save）
-- [ ] `←`/`→` で 5〜10 秒シーク（`seek_track`）。進捗ゲージは補間ではなく即時反映
-- [ ] `s` で現在曲をライブラリに保存/解除（`save_tracks` / `current_user_saved_tracks_contains`）、状態を表示
-- [ ] 連続シークのデバウンス／Connect 状態伝播遅延への配慮
+#### Phase 6.4 — シーク & 現在曲のお気に入り（Seek + save）✅
+- [x] `←`/`→` で 5 秒シーク（`seek_track`・`chrono::Duration`）。成功時にローカル進捗を即時更新して
+      即反映（強制ポーリングせず Connect 遅延の巻き戻り表示を回避）。目標算出は純粋関数 `view::seek_target`。
+- [x] `s` で現在曲をライブラリに保存/解除。非 deprecated の `library_add`/`library_remove`/`library_contains`
+      （`LibraryId::Track`）を使用。保存状態は state 行に `♥ 保存済み`/`♡ 未保存` を表示（`view::render_lines`）。
+      **`user-library-modify` スコープを追加**（要再ログイン）。Unknown 経路の URI は `track_id_from_json` で取得。
+- [x] 連続シークは「1 キー=1 API」（音量 +/- と同方針、ローカル進捗から積算）。保存状態は曲ごとに 1 回だけ
+      問い合わせ（`saved_checked`）で永続失敗の連打を回避。
+- [x] `fmt`/`clippy -D warnings`／`cargo test`（53 件・`seek_target`/`track_id_from_json`/saved 追加）・
+      ECC rust-reviewer 反映（CRITICAL: スコープ追加、MEDIUM: 問い合わせ上限・cast 明示）
+- [ ] 実端末での実 API 動作確認（[manual-tests.md](./manual-tests.md) の Phase 6.4 手順・要再ログイン）— **ユーザー実機で実施予定**
 
 #### Phase 6.5 — UI 仕上げ & 内部改善
 - [ ] `?` ヘルプオーバーレイ（キー一覧）、フッターの簡略化
@@ -223,5 +230,6 @@ spoterm lib               # 保存済みトラック/アルバム一覧・再生
     `transfer_playback` で実装できる見込み。
 
 ## 次の一手
-Phase 6.0（Now Playing）・6.1（検索）・6.2（ライブラリ閲覧）・6.3（デバイス選択）は実装・自動テスト・
-実機確認まで完了。次は Phase 6.4（シーク & 現在曲のお気に入り）に着手する。
+Phase 6.0〜6.3 は実装・自動テスト・実機確認まで完了。Phase 6.4（シーク & お気に入り）は実装・自動テスト・
+ECC レビューまで完了、残りは要再ログインでの実機確認（[manual-tests.md](./manual-tests.md) の Phase 6.4 手順）。
+確認後、Phase 6.5（UI 仕上げ & 内部改善）に着手する。
