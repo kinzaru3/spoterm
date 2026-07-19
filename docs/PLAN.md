@@ -1,6 +1,6 @@
 # spoterm 実装プラン
 
-Spotify Web API + spotifyd を使った Spotify CLI アプリ。
+Spotify Web API を使った Spotify CLI アプリ。再生デバイスは mac の公式 Spotify アプリ（Connect）を使う。
 
 ## 決定事項（ヒアリング結果）
 
@@ -10,7 +10,7 @@ Spotify Web API + spotifyd を使った Spotify CLI アプリ。
 | 機能スコープ | 再生コントロール / 検索して再生 / Now Playing 表示 / プレイリスト管理 / ライブラリ一覧・再生 |
 | UI 形式 | **段階的**（まずワンショットコマンド → 後で対話型 TUI） |
 | 配布 | 将来的に公開（OSS 前提の設計にする） |
-| アカウント | Spotify **Premium**（再生制御 API・spotifyd 再生が可能） |
+| アカウント | Spotify **Premium**（再生制御 API・Connect 再生が可能） |
 | Dev アプリ | 登録済み（Client ID 取得済み） |
 
 ## アーキテクチャ
@@ -20,27 +20,28 @@ Spotify Web API + spotifyd を使った Spotify CLI アプリ。
                                                           |
                                                   再生指示(device_id)
                                                           v
-                                              [spotifyd = Connect デバイス] --> 🔊
+                                          [公式 Spotify アプリ = Connect デバイス] --> 🔊
 ```
 
-- **spotifyd** はバックグラウンドで動く「再生デバイス」。spoterm は Web API 経由で
-  `spotifyd` デバイスへ再生をトランスファーして音を鳴らす。
+- **mac の公式 Spotify アプリ**が「再生デバイス」。起動・ログインしておくと Connect デバイスとして
+  見え、spoterm は Web API 経由でそのデバイスへ再生をトランスファーして音を鳴らす。
 - 認証は **Authorization Code + PKCE**（Client Secret を端末に置かなくてよい＝公開向き）。
+- **spotifyd（librespot ベースの非公式クライアント）はスコープ外**。spoterm 自体は librespot に依存しない。
 
 ## 開発環境（Docker）
 
 ホスト(mac)を汚さないため、Rust の開発・ビルドは **Docker コンテナ内**で行う。
-spotifyd と spoterm は Spotify クラウド経由で連携するため、この分離が可能。
+公式 Spotify アプリと spoterm は Spotify クラウド経由で連携するため、この分離が可能。
 
 ```
 [ホスト mac]                          [Docker コンテナ (Linux)]
-  spotifyd (brew, 音を出す) 🔊          rust toolchain + spoterm 開発
+  公式 Spotify アプリ (音を出す) 🔊      rust toolchain + spoterm 開発
   ブラウザ (OAuth 同意画面)             neovim (ホストの設定を持ち込み)
         ↕ Spotify クラウド ↕                    ↕
         └──────── どちらも api.spotify.com と通信 ────────┘
 ```
 
-- **spotifyd はホスト(mac)で起動**。コンテナ内だと mac のスピーカーに音を出せないため。
+- **公式 Spotify アプリはホスト(mac)で起動**。コンテナ内だと mac のスピーカーに音を出せないため。
 - **Claude(Bash)からは `docker compose exec` で操作**する。
 - 形式は **docker-compose + Dockerfile**。compose でマウント・ポート・named volume を宣言。
 - **nvim は設定のみ持ち込み**：`~/.config/nvim` をマウント。プラグインは OS/arch 差で
@@ -77,8 +78,8 @@ spoterm search <query>    # 曲/アルバム/アーティスト検索
 spoterm play [query]      # 検索 or 再開して再生
 spoterm pause | next | prev | toggle
 spoterm vol <0-100>
-spoterm devices           # 利用可能デバイス一覧（spotifyd を含む）
-spoterm device use <name> # spotifyd へ再生をトランスファー
+spoterm devices           # 利用可能デバイス一覧（公式 Spotify アプリを含む）
+spoterm device use <name> # 指定デバイス（公式アプリ）へ再生をトランスファー
 spoterm playlist ls | play <name>
 spoterm lib               # 保存済みトラック/アルバム一覧・再生
 ```
@@ -89,7 +90,7 @@ spoterm lib               # 保存済みトラック/アルバム一覧・再生
 - [ ] `Dockerfile`（Rust ベースイメージ + neovim + ビルド依存）
 - [ ] `docker-compose.yml`（上表のマウント・ポート・named volume）
 - [ ] コンテナ起動 & `docker compose exec` で shell / nvim が使えることを確認
-- [ ] ホスト側 `spotifyd` の設定（`~/.config/spotifyd/spotifyd.conf`、Premium ログイン、起動確認）
+- [ ] ホスト側で **公式 Spotify アプリ**を起動・Premium ログイン（Connect デバイスとして可視になることを確認）
 - [ ] Spotify Dashboard で **Redirect URI** に `http://127.0.0.1:8888/callback` を追加
 - [ ] Client ID を環境変数（`.env`）or 設定ファイルへ
 
@@ -232,11 +233,14 @@ spoterm lib               # 保存済みトラック/アルバム一覧・再生
   `refresh_token` を省略すると `null` で上書き保存し、以降リフレッシュ不能になる（実機で発生・修正済み）。
   対策として `token_refreshing=false` で自動更新を無効化し、`auth::authed_client` が期限切れ時のみ明示的に
   更新して旧 `refresh_token` を保持（`preserve_refresh_token`）、`0600` で保存する（`restrict_token_perms`）。
-- **spotifyd 可視性（Phase 3 devices で検証済み ✅）**：discovery(zeroconf) の spotifyd が Web API の
-  devices 一覧に出るか未確定だった件。詳細は [design/devices.md](./design/devices.md)。
-  - 検証結果（2026-07-18）: `MacBook-spotifyd` は **一覧に出た**。discovery 方式のままで可視で、
-    公式アプリでの事前アクティブ化や OAuth 方式への切替は不要。Phase 4 の `device use` はこの id への
-    `transfer_playback` で実装できる見込み。
+- **再生デバイスは公式 Spotify アプリに確定（spotifyd はスコープ外）**：当初は spotifyd（librespot ベースの
+  非公式クライアント）も再生デバイス候補にしていたが、Spotify Developer 規約・API 規約の観点（非公式クライアント
+  依存を避ける）と、mac の公式アプリで十分なことから **spotifyd は採用しない**。spoterm 本体は librespot に一切
+  依存しない（依存は `rspotify`＝公式 Web API クライアントのみ）。
+  - デバイス可視性の検証（2026-07-18・当時は spotifyd で確認）は Connect デバイス一般に当てはまり、公式アプリも
+    起動・ログインしておけば `devices` 一覧に現れ、`device use`／TUI の `d` から `transfer_playback` で再生を移せる。
+  - 詳細な設計履歴は [design/devices.md](./design/devices.md)（記述は当時の spotifyd 前提を含むが、対象デバイスを
+    公式アプリに読み替える）。
 
 ## 次の一手
 Phase 6.0〜6.4 は実装・自動テスト・実機確認まで完了。Phase 6.5（UI 仕上げ & 内部改善）は実装・自動テスト・
