@@ -1,0 +1,26 @@
+# Rust
+/target
+
+# secrets / local config
+.env
+token.json
+
+# Development docs kept private (sensitive; local only)
+docs/
+
+# Local dev environment (Docker is used only for local development on the maintainer's machine)
+Dockerfile
+docker-compose.yml
+
+# Claude Code session/report artifacts
+.claude/
+
+# OS
+.DS_Store
+
+
+# Added by cargo
+#
+# already existing elements were commented out
+
+#/target
