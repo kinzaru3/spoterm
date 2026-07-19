@@ -1,4 +1,4 @@
-//! `spoterm device use <name>`: transfer playback to the specified device.
+//! `spotterm device use <name>`: transfer playback to the specified device.
 
 use anyhow::{Context, Result};
 use rspotify::AuthCodePkceSpotify;
@@ -45,7 +45,7 @@ async fn execute(spotify: &AuthCodePkceSpotify, query: &str) -> Result<String> {
             format!("▶ Moved playback to '{}'", target.name)
         }
         NameMatch::None => {
-            format!("No device matching '{query}'. Check the list with `spoterm devices`")
+            format!("No device matching '{query}'. Check the list with `spotterm devices`")
         }
         NameMatch::Ambiguous(idxs) => {
             let mut lines = vec![format!(

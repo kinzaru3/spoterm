@@ -1,4 +1,4 @@
-//! `spoterm status`: display the current playback (Now Playing).
+//! `spotterm status`: display the current playback (Now Playing).
 
 use anyhow::{Context, Result};
 use rspotify::AuthCodePkceSpotify;
@@ -25,7 +25,7 @@ async fn execute(spotify: &AuthCodePkceSpotify) -> Result<String> {
         .context("failed to fetch playback status")?;
 
     let Some(ctx) = ctx else {
-        return Ok("Nothing is playing (start playback with `spoterm play`)".to_string());
+        return Ok("Nothing is playing (start playback with `spotterm play`)".to_string());
     };
 
     let device = ctx.device.name;

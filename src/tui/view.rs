@@ -95,7 +95,7 @@ pub fn render_lines(
     let Some(n) = now else {
         return RenderLines {
             state: "Nothing is playing".to_string(),
-            title: "  (press p to resume / `spoterm play` to start)".to_string(),
+            title: "  (press p to resume / `spotterm play` to start)".to_string(),
             artist: String::new(),
             album: String::new(),
             ratio: 0.0,

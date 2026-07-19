@@ -85,7 +85,7 @@ pub async fn authed_client(cfg: &Config) -> Result<AuthCodePkceSpotify> {
         .read_token_cache(true)
         .await
         .context("failed to read the token cache")?
-        .context("not logged in. Run `spoterm login` first")?;
+        .context("not logged in. Run `spotterm login` first")?;
 
     let token = if token.is_expired() {
         refresh_expired_token(&spotify, token).await?
@@ -117,7 +117,7 @@ pub async fn ensure_fresh_token(spotify: &AuthCodePkceSpotify) -> Result<()> {
             .expect("token mutex poisoned (implies a prior panic)");
         guard.clone()
     };
-    let token = current.context("not logged in. Run `spoterm login` first")?;
+    let token = current.context("not logged in. Run `spotterm login` first")?;
     if token.is_expired() {
         let refreshed = refresh_expired_token(spotify, token).await?;
         set_client_token(spotify, refreshed).await;
@@ -149,7 +149,7 @@ async fn refresh_expired_token(spotify: &AuthCodePkceSpotify, expired: Token) ->
         .await
         .context("failed to refresh the token")?
         .context(
-            "cannot refresh because there is no refresh_token. Log in again with `spoterm login`",
+            "cannot refresh because there is no refresh_token. Log in again with `spotterm login`",
         )?;
 
     let token = preserve_refresh_token(refreshed, previous_refresh_token);
@@ -253,7 +253,7 @@ fn restrict_token_perms(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `spoterm login`: authorize in the browser → receive the redirect on a local server → obtain and save the token.
+/// `spotterm login`: authorize in the browser → receive the redirect on a local server → obtain and save the token.
 pub async fn login(cfg: &Config) -> Result<()> {
     let mut spotify = build_client(cfg)?;
 
@@ -323,7 +323,7 @@ async fn wait_for_code(redirect_uri: &str, expected_state: &str) -> Result<Strin
     {
         Ok(result) => result,
         Err(_) => bail!(
-            "authorization timed out ({}s). Run `spoterm login` again",
+            "authorization timed out ({}s). Run `spotterm login` again",
             LOGIN_TIMEOUT.as_secs()
         ),
     }
@@ -580,7 +580,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let path =
-            std::env::temp_dir().join(format!("spoterm-perm-test-{}.json", std::process::id()));
+            std::env::temp_dir().join(format!("spotterm-perm-test-{}.json", std::process::id()));
         std::fs::write(&path, b"{}").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 

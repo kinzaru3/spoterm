@@ -24,7 +24,7 @@ impl Config {
 
 /// Config directory for the token cache and similar files (XDG compliant).
 pub fn config_dir() -> Result<PathBuf> {
-    let proj = directories::ProjectDirs::from("", "", "spoterm")
+    let proj = directories::ProjectDirs::from("", "", "spotterm")
         .context("could not determine the config directory")?;
     Ok(proj.config_dir().to_path_buf())
 }

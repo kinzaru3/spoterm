@@ -183,7 +183,7 @@ struct App {
     art_url: Option<String>,
 }
 
-/// `spoterm tui`: launch the Now Playing dashboard.
+/// `spotterm tui`: launch the Now Playing dashboard.
 pub async fn run(cfg: &Config) -> Result<()> {
     // If not logged in, fail clearly here and do not put the terminal into the alt-screen.
     // This client is handed straight into the loop and reused for the session.
@@ -1066,7 +1066,7 @@ fn draw_help(frame: &mut ratatui::Frame) {
     let area = frame.area();
     let outer = Block::default()
         .borders(Borders::ALL)
-        .title(" spoterm — Help ");
+        .title(" spotterm — Help ");
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
@@ -1109,7 +1109,7 @@ fn draw_now(frame: &mut ratatui::Frame, app: &mut App) {
     let area = frame.area();
     let outer = Block::default()
         .borders(Borders::ALL)
-        .title(" spoterm — Now Playing ");
+        .title(" spotterm — Now Playing ");
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
@@ -1220,7 +1220,7 @@ fn draw_browse(frame: &mut ratatui::Frame, state: &browse::BrowseState) {
     let area = frame.area();
     let outer = Block::default()
         .borders(Borders::ALL)
-        .title(" spoterm — Library ");
+        .title(" spotterm — Library ");
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
@@ -1288,7 +1288,7 @@ fn draw_devices(frame: &mut ratatui::Frame, state: &devices::DevicePickerState) 
     let area = frame.area();
     let outer = Block::default()
         .borders(Borders::ALL)
-        .title(" spoterm — Devices ");
+        .title(" spotterm — Devices ");
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
@@ -1350,7 +1350,7 @@ fn draw_search(frame: &mut ratatui::Frame, state: &SearchState) {
     let area = frame.area();
     let outer = Block::default()
         .borders(Borders::ALL)
-        .title(" spoterm — Search ");
+        .title(" spotterm — Search ");
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 

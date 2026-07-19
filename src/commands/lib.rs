@@ -1,4 +1,4 @@
-//! `spoterm lib`. List saved tracks and albums (read-only).
+//! `spotterm lib`. List saved tracks and albums (read-only).
 
 use anyhow::{Context, Result};
 use rspotify::AuthCodePkceSpotify;

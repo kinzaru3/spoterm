@@ -1,4 +1,4 @@
-//! `spoterm playlist ls|play`. List playlists and play one by name.
+//! `spotterm playlist ls|play`. List playlists and play one by name.
 
 use anyhow::{Context, Result};
 use rspotify::AuthCodePkceSpotify;
@@ -101,7 +101,7 @@ async fn exec_play(spotify: &AuthCodePkceSpotify, query: &str) -> Result<String>
 /// Pure function that builds the "no matching playlist" message. When only the first page
 /// was matched, note that (`shown` items).
 fn no_match_message(query: &str, truncated: bool, shown: usize) -> String {
-    let base = format!("No playlist matching '{query}'. Check with `spoterm playlist ls`");
+    let base = format!("No playlist matching '{query}'. Check with `spotterm playlist ls`");
     if truncated {
         format!("{base} (only the first {shown} were matched)")
     } else {
@@ -206,7 +206,7 @@ mod tests {
         let out = no_match_message("mix", false, 12);
         assert_eq!(
             out,
-            "No playlist matching 'mix'. Check with `spoterm playlist ls`"
+            "No playlist matching 'mix'. Check with `spotterm playlist ls`"
         );
     }
 
