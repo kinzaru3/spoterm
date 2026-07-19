@@ -91,6 +91,30 @@ pub async fn authed_client(cfg: &Config) -> Result<AuthCodePkceSpotify> {
     Ok(spotify)
 }
 
+/// 長時間保持するクライアント（TUI）向けに、必要なときだけトークンを更新する。
+/// [`authed_client`] と違い毎回ディスクを読み直さず、reqwest の接続プールを使い回せる。
+/// 期限内なら何もしないので安価で、ポーリングや連続操作のたびに呼んでよい。
+///
+/// 前提: **単一タスクからの逐次呼び出し**であること（TUI のイベントループは spawn せず
+/// 逐次 await するのでこれを満たす）。期限判定〜リフレッシュはアトミックでないため、同一
+/// クライアントを複数タスクで共有して並行に呼ぶと二重リフレッシュの競合になり得る。
+pub async fn ensure_fresh_token(spotify: &AuthCodePkceSpotify) -> Result<()> {
+    let current = {
+        let token_mutex = spotify.get_token();
+        let guard = token_mutex
+            .lock()
+            .await
+            .expect("token mutex poisoned (implies a prior panic)");
+        guard.clone()
+    };
+    let token = current.context("未ログインです。先に `spoterm login` を実行してください")?;
+    if token.is_expired() {
+        let refreshed = refresh_expired_token(spotify, token).await?;
+        set_client_token(spotify, refreshed).await;
+    }
+    Ok(())
+}
+
 /// 認証済みクライアントのトークンをロック経由で設定する。この CLI は単発実行でトークンロックを
 /// 他スレッドと共有しないため poison は起こらない（poison は先行 panic を意味する）。
 async fn set_client_token(spotify: &AuthCodePkceSpotify, token: Token) {

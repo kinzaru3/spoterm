@@ -162,11 +162,18 @@ spoterm lib               # 保存済みトラック/アルバム一覧・再生
       入力へ戻る際に古い結果/選択をクリア・補足文言を純粋関数化
 - [ ] 実端末での実 API 動作確認（[manual-tests.md](./manual-tests.md) の Phase 6.1 手順）— **ユーザー実機で実施予定**
 
-#### Phase 6.2 — ライブラリ / プレイリスト閲覧・再生（Browse view）
-- [ ] ビュー切替（例 `1`=Now / `2`=Library / `3`=Playlists、または `l`/`o`）でリスト画面へ
-- [ ] 保存済みトラック・アルバム（`lib`）とプレイリスト（`playlist ls`）を一覧、`Enter` で再生
-- [ ] スクロール/ページング（先頭 N 件超はスクロール、取得は既存コマンドの上限に合わせる）
-- [ ] 一覧整形は `format::render_entry` を流用、選択状態のハイライトを追加
+#### Phase 6.2 — ライブラリ / プレイリスト閲覧・再生（Browse view）✅
+- [x] Now Playing で `2` → ライブラリ閲覧オーバーレイ（新モジュール `src/tui/browse.rs`）
+  - タブ = プレイリスト / 保存トラック / 保存アルバム。`←`/`→` でタブ切替、`↑`/`↓` 選択、`Enter` 再生、`Esc` 戻る。
+  - 取得は既存コマンドと同じ API（`current_user_playlists_manual` / `current_user_saved_tracks_manual` /
+    `current_user_saved_albums_manual`、先頭ページ 50/20/20）を再利用。
+  - 再生：トラックは URI 単体（`start_uris_playback`）、プレイリスト/アルバムはコンテキスト（`start_context_playback`）。
+  - キー処理は同期で選択更新→`BrowseAction` を返し本体が非同期実行（検索と同じ借用回避パターン）。
+    `browse.rs` は `App` に触れずデータ取得・再生・キー変換のみ担当。
+- [x] 空タブ・取得失敗・再生失敗はオーバーレイ内メッセージで表示（silent failure 禁止／`draw_browse` が描画）
+- [x] 行整形は検索と共通の純粋関数 `view::search_row` を再利用、選択ハイライト（ratatui `List`/`ListState`）
+- [x] `fmt`/`clippy -D warnings` 通過、単体テスト 44 件
+- [ ] 実端末での実 API 動作確認（[manual-tests.md](./manual-tests.md) の Phase 6.2 手順）— **ユーザー実機で実施予定**
 
 #### Phase 6.3 — デバイス選択（Device picker）
 - [ ] `d` でデバイス一覧オーバーレイ（`devices` 再利用）、`Enter` で `transfer_playback`（spotifyd 等へ）
@@ -210,5 +217,5 @@ spoterm lib               # 保存済みトラック/アルバム一覧・再生
     `transfer_playback` で実装できる見込み。
 
 ## 次の一手
-Phase 6.0（Now Playing）・6.1（検索して再生）は実装・自動テスト完了。6.1 は残りユーザー実機での実 API 確認
-（[manual-tests.md](./manual-tests.md) の Phase 6.1 手順）。確認後、Phase 6.2（ライブラリ/プレイリスト閲覧）に着手する。
+Phase 6.0（Now Playing）・6.1（検索）・6.2（ライブラリ閲覧）は実装・自動テスト完了。6.2 は残りユーザー実機での
+実 API 確認（[manual-tests.md](./manual-tests.md) の Phase 6.2 手順）。確認後、Phase 6.3（デバイス選択）に着手する。
