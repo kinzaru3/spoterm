@@ -1,6 +1,7 @@
 //! `spoterm status`: display the current playback (Now Playing).
 
 use anyhow::{Context, Result};
+use rspotify::AuthCodePkceSpotify;
 use rspotify::model::PlayableItem;
 use rspotify::prelude::*;
 use serde_json::Value;
@@ -11,15 +12,20 @@ use crate::format::{format_ms, join_artists};
 
 pub async fn run(cfg: &Config) -> Result<()> {
     let spotify = auth::authed_client(cfg).await?;
+    println!("{}", execute(&spotify).await?);
+    Ok(())
+}
 
+/// Fetch the current playback and build the display block. Returns the text to print so the
+/// API glue (request + response mapping, including the Unknown fallback) is testable.
+async fn execute(spotify: &AuthCodePkceSpotify) -> Result<String> {
     let ctx = spotify
         .current_playback(None, None::<Vec<_>>)
         .await
         .context("failed to fetch playback status")?;
 
     let Some(ctx) = ctx else {
-        println!("Nothing is playing (start playback with `spoterm play`)");
-        return Ok(());
+        return Ok("Nothing is playing (start playback with `spoterm play`)".to_string());
     };
 
     let device = ctx.device.name;
@@ -28,10 +34,10 @@ pub async fn run(cfg: &Config) -> Result<()> {
     // without surfacing the type name.
     let progress_ms = ctx.progress.map(|d| d.num_milliseconds().max(0) as u128);
 
-    match ctx.item {
+    let line = match ctx.item {
         Some(PlayableItem::Track(track)) => {
             let artists: Vec<String> = track.artists.into_iter().map(|a| a.name).collect();
-            let line = render_track(
+            render_track(
                 ctx.is_playing,
                 &track.name,
                 &join_artists(&artists),
@@ -40,28 +46,24 @@ pub async fn run(cfg: &Config) -> Result<()> {
                 track.duration.num_milliseconds().max(0) as u128,
                 &device,
                 vol,
-            );
-            println!("{line}");
+            )
         }
-        Some(PlayableItem::Episode(ep)) => {
-            let line = render_track(
-                ctx.is_playing,
-                &ep.name,
-                "(podcast)",
-                None,
-                progress_ms,
-                ep.duration.num_milliseconds().max(0) as u128,
-                &device,
-                vol,
-            );
-            println!("{line}");
-        }
+        Some(PlayableItem::Episode(ep)) => render_track(
+            ctx.is_playing,
+            &ep.name,
+            "(podcast)",
+            None,
+            progress_ms,
+            ep.duration.num_milliseconds().max(0) as u128,
+            &device,
+            vol,
+        ),
         // Spotify's /me/player does not return external_ids for tracks, so rspotify's FullTrack
         // parsing fails and falls back to Unknown(raw JSON). Extract the values we need from the
         // raw JSON and display them as a fallback.
         Some(PlayableItem::Unknown(v)) => {
             let (title, artists, album, duration_ms) = track_from_json(&v);
-            let line = render_track(
+            render_track(
                 ctx.is_playing,
                 &title,
                 &join_artists(&artists),
@@ -70,13 +72,12 @@ pub async fn run(cfg: &Config) -> Result<()> {
                 duration_ms,
                 &device,
                 vol,
-            );
-            println!("{line}");
+            )
         }
-        None => println!("Playing, but track info is unavailable (possibly an ad, etc.)"),
-    }
+        None => "Playing, but track info is unavailable (possibly an ad, etc.)".to_string(),
+    };
 
-    Ok(())
+    Ok(line)
 }
 
 /// Extract the values needed for display (title, artist names, album name, duration ms)
@@ -174,6 +175,38 @@ fn render_track(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn execute_reports_nothing_when_no_playback() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/me/player"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = crate::auth::test_client(&server.uri()).await;
+        let out = execute(&client).await.unwrap();
+        assert!(out.contains("Nothing is playing"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn execute_falls_back_to_raw_json_for_unknown_track() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/me/player"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::test_fixtures::playback_unknown_track("Fallback Song", "Fallback Artist"),
+            ))
+            .mount(&server)
+            .await;
+        let client = crate::auth::test_client(&server.uri()).await;
+        let out = execute(&client).await.unwrap();
+        assert!(out.contains("Fallback Song"), "{out}");
+        assert!(out.contains("Fallback Artist"), "{out}");
+        assert!(out.contains("Fallback Album"), "{out}");
+    }
 
     #[test]
     fn render_track_playing_with_progress() {

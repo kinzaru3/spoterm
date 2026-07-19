@@ -173,6 +173,34 @@ fn token_cache_path() -> Result<PathBuf> {
     Ok(config::config_dir()?.join(TOKEN_CACHE_FILE))
 }
 
+/// Test-only helper: build a client whose API base URL points at a mock server
+/// (`api_base_url`) with a dummy token already installed, bypassing PKCE and the
+/// token cache. Shared by the per-command `execute` tests (`commands::*`).
+#[cfg(test)]
+pub(crate) async fn test_client(api_base_url: &str) -> AuthCodePkceSpotify {
+    let creds = Credentials::new_pkce("test-client-id");
+    let oauth = OAuth {
+        redirect_uri: "http://127.0.0.1/callback".to_string(),
+        ..Default::default()
+    };
+    let rconf = RSpotifyConfig {
+        api_base_url: api_base_url.to_string(),
+        token_cached: false,
+        token_refreshing: false,
+        ..Default::default()
+    };
+    let spotify = AuthCodePkceSpotify::with_config(creds, oauth, rconf);
+    set_client_token(
+        &spotify,
+        Token {
+            access_token: "test-access-token".to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    spotify
+}
+
 /// Save the refreshed token to the cache (protected at 0600). Pre-create it at 0600 before
 /// write_cache to close the window where a newly created file is briefly world-readable depending
 /// on umask (write_cache reuses the existing inode via create+truncate, so the permissions are
