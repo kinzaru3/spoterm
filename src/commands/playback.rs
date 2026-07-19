@@ -3,13 +3,17 @@
 
 use anyhow::{Context, Result};
 use rspotify::AuthCodePkceSpotify;
-use rspotify::model::{PlayableId, SearchResult, SearchType};
+use rspotify::model::{Offset, PlayableId, SearchResult, SearchType};
 use rspotify::prelude::*;
 
 use super::NEED_DEVICE_HINT;
 use crate::auth;
 use crate::config::Config;
 use crate::format::join_artists;
+
+/// How many search matches `play <query>` queues so that `next`/`prev` have somewhere to go.
+/// The Search API `limit` maxes out at 10 (see `docs/design/search.md`), so stay within that.
+const PLAY_QUEUE_LIMIT: u32 = 10;
 
 pub async fn pause(cfg: &Config) -> Result<()> {
     let spotify = auth::authed_client(cfg).await?;
@@ -115,10 +119,17 @@ async fn exec_play(spotify: &AuthCodePkceSpotify, query: &[String]) -> Result<St
         return Ok("▶ Resumed playback".to_string());
     }
 
-    // With a query, search for the top track and play it.
+    // With a query, search for the top matches and play them as a queue so `next`/`prev` work.
     let q = query.join(" ");
     let result = spotify
-        .search(&q, SearchType::Track, None, None, Some(1), None)
+        .search(
+            &q,
+            SearchType::Track,
+            None,
+            None,
+            Some(PLAY_QUEUE_LIMIT),
+            None,
+        )
         .await
         .context("search failed")?;
 
@@ -126,19 +137,32 @@ async fn exec_play(spotify: &AuthCodePkceSpotify, query: &[String]) -> Result<St
         anyhow::bail!("unexpected search result format");
     };
 
-    let Some(track) = page.items.into_iter().next() else {
+    // Keep only playable tracks (those with a URI); local songs have no id and are skipped.
+    // Remember the top hit's name/artists for the confirmation message.
+    let mut ids: Vec<_> = Vec::new();
+    let mut top: Option<(String, Vec<String>)> = None;
+    for track in page.items {
+        let Some(id) = track.id else { continue };
+        if top.is_none() {
+            let artists = track.artists.into_iter().map(|a| a.name).collect();
+            top = Some((track.name, artists));
+        }
+        ids.push(id);
+    }
+
+    let Some((name, artists)) = top else {
         return Ok(format!("No track found matching \"{q}\""));
     };
 
-    // The fields are independent, so they can be moved out individually.
-    let name = track.name;
-    let artists: Vec<String> = track.artists.into_iter().map(|a| a.name).collect();
-    let id = track
-        .id
-        .context("not a playable track (e.g. a local song with no URI)")?;
-
+    // Start at the top hit; the rest stay queued behind it.
+    let offset = Offset::Uri(ids[0].uri());
     spotify
-        .start_uris_playback([PlayableId::Track(id)], None, None, None)
+        .start_uris_playback(
+            ids.into_iter().map(PlayableId::Track),
+            None,
+            Some(offset),
+            None,
+        )
         .await
         .with_context(|| format!("failed to start playback{NEED_DEVICE_HINT}"))?;
 
@@ -263,6 +287,47 @@ mod tests {
             .await;
         let client = crate::auth::test_client(&server.uri()).await;
         assert_eq!(exec_toggle(&client).await.unwrap(), "⏸ Paused");
+    }
+
+    #[tokio::test]
+    async fn exec_play_queues_all_matches_and_offsets_to_top() {
+        let server = MockServer::start().await;
+        let tracks = fx::page(
+            vec![
+                fx::full_track("4iV5W9uYEdYUVa79Axb7Rh", "Song One", "Artist A"),
+                fx::full_track("1301WleyT98MSxVHPZCA6M", "Song Two", "Artist B"),
+            ],
+            2,
+        );
+        Mock::given(method("GET"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "tracks": tracks })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/me/player/play"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = crate::auth::test_client(&server.uri()).await;
+
+        let out = exec_play(&client, &["song".to_string()]).await.unwrap();
+        assert_eq!(out, "▶ Playing: Song One — Artist A");
+
+        // The play request must queue every match (so `next`/`prev` work) and start at the top hit.
+        let reqs = server.received_requests().await.unwrap();
+        let play = reqs
+            .iter()
+            .find(|r| r.url.path() == "/me/player/play")
+            .expect("a play request was sent");
+        let body: serde_json::Value = play.body_json().unwrap();
+        let uris = body["uris"].as_array().expect("uris array");
+        assert_eq!(uris.len(), 2, "all matches are queued");
+        assert_eq!(uris[0], "spotify:track:4iV5W9uYEdYUVa79Axb7Rh");
+        assert_eq!(
+            body["offset"]["uri"],
+            "spotify:track:4iV5W9uYEdYUVa79Axb7Rh"
+        );
     }
 
     #[tokio::test]

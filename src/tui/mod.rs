@@ -31,7 +31,7 @@ use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 use rspotify::AuthCodePkceSpotify;
 use rspotify::model::{
-    CurrentPlaybackContext, FullTrack, LibraryId, PlayableId, PlayableItem, SearchResult,
+    CurrentPlaybackContext, FullTrack, LibraryId, Offset, PlayableId, PlayableItem, SearchResult,
     SearchType, TrackId,
 };
 use rspotify::prelude::*;
@@ -141,8 +141,11 @@ enum SearchAction {
     Close,
     /// Run a search with the query.
     Submit(String),
-    /// Play the selected track (URI).
-    Play(String),
+    /// Play the results as a queue, starting at `selected`, so `next`/`prev` walk the hit list.
+    Play {
+        uris: Vec<String>,
+        selected: usize,
+    },
     /// Go back from result selection to input (edit the query).
     BackToInput,
 }
@@ -344,7 +347,7 @@ async fn handle_search_key(key: KeyEvent, app: &mut App) {
         SearchAction::None => {}
         SearchAction::Close => app.mode = Mode::Normal,
         SearchAction::Submit(q) => run_search(app, &q).await,
-        SearchAction::Play(uri) => play_uri(app, uri).await,
+        SearchAction::Play { uris, selected } => play_selection(app, &uris, selected).await,
         SearchAction::BackToInput => {
             if let Mode::Search(state) = &mut app.mode {
                 // Going back to input means rebuilding the query. Discard the old results and selection.
@@ -391,10 +394,18 @@ fn search_key_action(key: KeyEvent, state: &mut SearchState) -> SearchAction {
                 }
                 SearchAction::None
             }
-            KeyCode::Enter => match state.results.get(state.selected) {
-                Some(hit) => SearchAction::Play(hit.uri.clone()),
-                None => SearchAction::None,
-            },
+            KeyCode::Enter => {
+                if state.results.is_empty() {
+                    SearchAction::None
+                } else {
+                    // Queue every hit so `next`/`prev` walk the result list, starting at the selection.
+                    let uris = state.results.iter().map(|h| h.uri.clone()).collect();
+                    SearchAction::Play {
+                        uris,
+                        selected: state.selected,
+                    }
+                }
+            }
             _ => SearchAction::None,
         },
     }
@@ -449,10 +460,11 @@ fn track_to_hit(t: FullTrack) -> Option<TrackHit> {
     })
 }
 
-/// Play the selected track's URI. On success, return to the normal view; on failure, stay on the
-/// overlay and inform via a message (the search screen does not draw `app.status`, so use `state.message` here).
-async fn play_uri(app: &mut App, uri: String) {
-    match play_track(app, &uri).await {
+/// Play the search results as a queue, starting at `selected`. On success, return to the normal
+/// view; on failure, stay on the overlay and inform via a message (the search screen does not draw
+/// `app.status`, so use `state.message` here).
+async fn play_selection(app: &mut App, uris: &[String], selected: usize) {
+    match start_playback_queue(app, uris, selected).await {
         Ok(()) => {
             app.status = "▶ Playback started".to_string();
             app.last_poll = None; // Reflect playback start on screen quickly
@@ -468,14 +480,27 @@ async fn play_uri(app: &mut App, uri: String) {
     }
 }
 
-async fn play_track(app: &App, uri: &str) -> Result<()> {
-    let id = TrackId::from_uri(uri).context("failed to parse the track URI")?;
+async fn start_playback_queue(app: &App, uris: &[String], selected: usize) -> Result<()> {
+    let (ids, offset) = queue_from_uris(uris, selected)?;
     auth::ensure_fresh_token(&app.client).await?;
     app.client
-        .start_uris_playback([PlayableId::Track(id)], None, None, None)
+        .start_uris_playback(ids.into_iter().map(PlayableId::Track), None, offset, None)
         .await
         .context("failed to start playback (an active device may be required)")?;
     Ok(())
+}
+
+/// Parse result URIs into track ids and compute the play offset for the selected index.
+/// Queueing every hit (not just the selected one) is what gives `next`/`prev` somewhere to go.
+/// A URI that fails to parse aborts the whole play rather than silently dropping a track.
+fn queue_from_uris(uris: &[String], selected: usize) -> Result<(Vec<TrackId<'_>>, Option<Offset>)> {
+    let ids = uris
+        .iter()
+        .map(|u| TrackId::from_uri(u))
+        .collect::<Result<Vec<_>, _>>()
+        .context("failed to parse a track URI")?;
+    let offset = uris.get(selected).map(|u| Offset::Uri(u.clone()));
+    Ok((ids, offset))
 }
 
 // ---- API integration --------------------------------------------------------
@@ -1381,4 +1406,43 @@ fn draw_search(frame: &mut ratatui::Frame, state: &SearchState) {
             .style(dim),
         rows[3],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn uri(id: &str) -> String {
+        format!("spotify:track:{id}")
+    }
+
+    #[test]
+    fn queue_from_uris_queues_all_hits_and_offsets_to_selection() {
+        let uris = vec![uri("4iV5W9uYEdYUVa79Axb7Rh"), uri("1301WleyT98MSxVHPZCA6M")];
+
+        let (ids, offset) = queue_from_uris(&uris, 1).unwrap();
+
+        // Every hit is queued so `next`/`prev` have somewhere to go...
+        assert_eq!(ids.len(), 2);
+        // ...and playback starts at the selected track, not the first one.
+        assert_eq!(offset, Some(Offset::Uri(uris[1].clone())));
+    }
+
+    #[test]
+    fn queue_from_uris_rejects_an_unparseable_uri() {
+        let uris = vec![uri("4iV5W9uYEdYUVa79Axb7Rh"), "not-a-uri".to_string()];
+
+        assert!(queue_from_uris(&uris, 0).is_err());
+    }
+
+    #[test]
+    fn queue_from_uris_without_a_matching_selection_omits_the_offset() {
+        let uris = vec![uri("4iV5W9uYEdYUVa79Axb7Rh")];
+
+        // `selected` past the end yields no offset (Spotify then starts at the queue head).
+        let (ids, offset) = queue_from_uris(&uris, 9).unwrap();
+
+        assert_eq!(ids.len(), 1);
+        assert_eq!(offset, None);
+    }
 }
