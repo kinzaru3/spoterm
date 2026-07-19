@@ -214,6 +214,22 @@ spoterm lib               # 保存済みトラック/アルバム一覧・再生
       ECC レビュー（rust-reviewer + silent-failure-hunter）反映
 - [ ] 実端末での実 API 動作確認（[manual-tests.md](./manual-tests.md) の Phase 6.5 手順）— **ユーザー実機で実施予定**
 
+#### Phase 6.6 — カバーアート表示（Cover art）
+コンプラ調査で挙がった「再生時はカバーアート＋メタデータを表示」（Spotify Developer Policy）の未充足を解消。
+- [x] `ratatui-image` で Now Playing 左にカバーアートを表示。端末を問い合わせて最適プロトコル
+      （Kitty/iTerm2/Sixel）を自動選択、非対応端末は halfblocks（カラー半ブロック）へフォールバック。
+      **ratatui 0.29→0.30 へアップグレード**（ratatui-image 11.0.6 が 0.30 依存・自作コードは無改修で移行）。
+- [x] 依存追加: `ratatui-image`（`=11.0.6` pin）/ `image`（jpeg,png）/ `reqwest`（rustls・タイムアウト5s・
+      リダイレクト無効）。アート URL 選択は純粋関数 `art::pick_image_url`、取得+デコードは
+      `art::fetch_decode`（`spawn_blocking`・デコード寸法上限 4096）。Unknown 経路は `album_images_from_json`。
+- [x] 曲変化時のみ取得（`art_url` で 1 回化）。`r` で再取得可（行き止まりにしない）。取得失敗はステータス表示、
+      アート無し（エピソード等）は「(アートなし)」プレースホルダで空状態を明示（silent failure 禁止）。
+- [x] セキュリティ: `art::is_allowed_art_url` で `https`＋`*.scdn.co` に限定（SSRF 対策・単体テスト）。
+- [x] `fmt`/`clippy -D warnings`／`cargo test`（64 件・`pick_image_url`/`album_images_from_json`/`is_allowed_art_url` 追加）・
+      ECC レビュー（rust-reviewer + silent-failure-hunter + security-reviewer 並列＋再レビュー）反映
+- [ ] 実端末での実 API 動作確認（[manual-tests.md](./manual-tests.md) の Phase 6.6 手順）— **ユーザー実機で実施予定**
+- 保留（フォローアップ）: `pick_image_url` の幅0タイブレーク、描画時 `last_encoding_result()` の失敗検出（LOW）。
+
 > 各サブフェーズは独立した小さめの PR で進める想定。優先度・順序は要望に応じて入れ替え可。
 
 ### Phase 7 — テスト & 配布

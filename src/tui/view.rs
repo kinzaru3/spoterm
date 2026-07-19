@@ -19,6 +19,8 @@ pub struct NowPlaying {
     /// 現在曲のトラック URI（`spotify:track:…`）。保存操作・曲変化検知に使う。
     /// エピソードや曲情報不明のときは `None`。
     pub track_uri: Option<String>,
+    /// カバーアート画像の URL（選択済み）。アート取得・曲変化検知に使う。無い場合は `None`。
+    pub album_image_url: Option<String>,
     /// このスナップショットを取得した時刻（進捗補間の基点）。
     pub fetched_at: Instant,
 }
@@ -274,6 +276,7 @@ mod tests {
             device: "spotifyd".to_string(),
             volume: Some(40),
             track_uri: Some("spotify:track:xxxx".to_string()),
+            album_image_url: None,
             fetched_at: std::time::Instant::now(),
         }
     }

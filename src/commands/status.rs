@@ -114,6 +114,26 @@ pub(crate) fn track_id_from_json(v: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// `/me/player` のトラック JSON（Unknown に落ちたもの）から、アルバムのカバーアート候補を
+/// `(url, width, height)` のリストで取り出す。`width`/`height` 欠落は 0 とする（TUI の
+/// カバーアート表示が Unknown 経路でも動くよう crate 内公開）。
+pub(crate) fn album_images_from_json(v: &Value) -> Vec<(String, u32, u32)> {
+    v.get("album")
+        .and_then(|a| a.get("images"))
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|img| {
+                    let url = img.get("url").and_then(Value::as_str)?.to_string();
+                    let width = img.get("width").and_then(Value::as_u64).unwrap_or(0) as u32;
+                    let height = img.get("height").and_then(Value::as_u64).unwrap_or(0) as u32;
+                    Some((url, width, height))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// 再生状況の表示ブロックを組み立てる純粋関数。API 応答からの写像は呼び出し側で行う。
 // 表示に必要な素をプリミティブで受け取りテスト容易性を優先している。呼び出し元は 1 箇所のみで
 // 専用の表示用構造体を挟むほどの重複はないため、引数の多さは許容する（YAGNI）。
@@ -225,5 +245,25 @@ mod tests {
         assert_eq!(track_id_from_json(&ep), None);
         // uri 欠落
         assert_eq!(track_id_from_json(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn album_images_from_json_extracts_list() {
+        let v = serde_json::json!({
+            "album": { "images": [
+                { "url": "u640", "width": 640, "height": 640 },
+                { "url": "u300", "width": 300, "height": 300 },
+                { "url": "u_noWidth" }
+            ]}
+        });
+        let imgs = album_images_from_json(&v);
+        assert_eq!(imgs.len(), 3);
+        assert_eq!(imgs[0], ("u640".to_string(), 640, 640));
+        assert_eq!(imgs[2], ("u_noWidth".to_string(), 0, 0)); // 幅欠落は 0
+    }
+
+    #[test]
+    fn album_images_from_json_empty_when_missing() {
+        assert!(album_images_from_json(&serde_json::json!({})).is_empty());
     }
 }

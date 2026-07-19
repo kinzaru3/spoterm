@@ -7,6 +7,7 @@
 //!   [`view::interpolate_progress`] で進捗をローカル補間して滑らかに見せる。
 //! - API エラーはステータス行に出してループは継続する（silent failure 禁止）。
 
+mod art;
 mod browse;
 mod devices;
 mod view;
@@ -25,6 +26,9 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph};
+use ratatui_image::StatefulImage;
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::StatefulProtocol;
 use rspotify::AuthCodePkceSpotify;
 use rspotify::model::{
     CurrentPlaybackContext, FullTrack, LibraryId, PlayableId, PlayableItem, SearchResult,
@@ -165,6 +169,14 @@ struct App {
     /// 現在曲の保存状態を問い合わせ済みか。曲ごとに 1 回だけ問い合わせ、永続失敗での
     /// 毎ポーリング連打を防ぐ（曲が変わると `false` に戻す）。
     saved_checked: bool,
+    /// カバーアート取得用の HTTP クライアント（接続プールを使い回す）。
+    http: reqwest::Client,
+    /// 端末の画像プロトコル判定器（起動時に 1 回だけ生成）。
+    picker: Picker,
+    /// 現在表示中のカバーアート（描画プロトコル）。無い/未取得なら `None`。
+    art: Option<StatefulProtocol>,
+    /// `art` が対応する画像 URL。曲変化（URL 変化）時のみ取得し直す。
+    art_url: Option<String>,
 }
 
 /// `spoterm tui`: Now Playing ダッシュボードを起動する。
@@ -175,9 +187,13 @@ pub async fn run(cfg: &Config) -> Result<()> {
         .await
         .context("TUI を起動できません")?;
 
+    // 画像プロトコルの判定は端末への問い合わせ（stdin/stdout）を伴うため、alt-screen に
+    // 入る前に行う。判定に失敗した端末では halfblocks（カラー半ブロック）へフォールバック。
+    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+
     install_panic_hook();
     let mut terminal = setup_terminal().context("端末の初期化に失敗しました")?;
-    let result = run_loop(&mut terminal, client).await;
+    let result = run_loop(&mut terminal, client, picker).await;
     // 描画結果に関わらず端末は必ず元に戻す。両方失敗したら両方を伝える。
     let restored = restore_terminal(&mut terminal);
     match (result, restored) {
@@ -188,7 +204,7 @@ pub async fn run(cfg: &Config) -> Result<()> {
 }
 
 /// メインループ。ポーリング → 描画 → 入力処理を繰り返す。
-async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify) -> Result<()> {
+async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify, picker: Picker) -> Result<()> {
     let mut app = App {
         client,
         now: None,
@@ -199,6 +215,16 @@ async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify) -> Result<()
         browse_cache: browse::BrowseCache::default(),
         saved: None,
         saved_checked: false,
+        // タイムアウトを課し（ハングでループが凍結しないよう）、リダイレクトは無効化する
+        // （SSRF 対策：許可ホスト外へ飛ばされない）。組み立て失敗時は素の Client にフォールバック。
+        http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new()),
+        picker,
+        art: None,
+        art_url: None,
     };
 
     // ステータス行の自動クリア用（変化を検知して計時。App には持たせず本ループ内で完結）。
@@ -229,7 +255,7 @@ async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify) -> Result<()
             last_status.clear();
         }
 
-        terminal.draw(|frame| draw(frame, &app))?;
+        terminal.draw(|frame| draw(frame, &mut app))?;
 
         // TICK までキー入力を待つ（無ければ再描画して進捗を進める）。
         // Windows ではリリースでも発火するため押下のみ処理する。
@@ -288,10 +314,12 @@ async fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
         KeyCode::Left => control_seek(app, -SEEK_STEP_MS).await,
         KeyCode::Right => control_seek(app, SEEK_STEP_MS).await,
         KeyCode::Char('s') => control_save(app).await,
-        // 手動更新: 失敗カウンタもリセットして自動更新を再開する。
+        // 手動更新: 失敗カウンタをリセットし自動更新を再開。カバーアートも取り直せるよう
+        // art_url をクリアする（取得失敗した曲でも `r` で再取得できる＝行き止まりにしない）。
         KeyCode::Char('r') => {
             app.poll_failures = 0;
             app.last_poll = None;
+            app.art_url = None;
         }
         _ => {}
     }
@@ -467,11 +495,14 @@ async fn poll_playback(app: &mut App) {
                 app.status.clear();
             }
             refresh_saved(app).await;
+            refresh_art(app).await;
         }
         Ok(None) => {
             app.now = None;
             app.saved = None;
             app.saved_checked = false;
+            app.art = None;
+            app.art_url = None;
             app.poll_failures = 0;
             if was_failing && view::status_kind(&app.status) == view::StatusKind::Warn {
                 app.status.clear();
@@ -509,13 +540,21 @@ fn snapshot_from_context(ctx: CurrentPlaybackContext) -> NowPlaying {
         .unwrap_or(0);
     let is_playing = ctx.is_playing;
 
-    // track_uri は保存操作・曲変化検知に使う。Track は型付き ID、Unknown は生 JSON から取り出す。
-    let (title, artists, album, duration_ms, track_uri) = match ctx.item {
+    // track_uri は保存操作・曲変化検知に、album_image_url はカバーアート取得に使う。
+    // Track は型付きモデル、Unknown は生 JSON から取り出す。
+    let (title, artists, album, duration_ms, track_uri, album_image_url) = match ctx.item {
         Some(PlayableItem::Track(t)) => {
             let artists: Vec<String> = t.artists.into_iter().map(|a| a.name).collect();
             let dur = t.duration.num_milliseconds().max(0) as u128;
             let uri = t.id.as_ref().map(|id| id.uri());
-            (t.name, artists, Some(t.album.name), dur, uri)
+            let images: Vec<(String, u32, u32)> = t
+                .album
+                .images
+                .into_iter()
+                .map(|im| (im.url, im.width.unwrap_or(0), im.height.unwrap_or(0)))
+                .collect();
+            let art_url = art::pick_image_url(&images);
+            (t.name, artists, Some(t.album.name), dur, uri, art_url)
         }
         Some(PlayableItem::Episode(e)) => {
             let dur = e.duration.num_milliseconds().max(0) as u128;
@@ -525,17 +564,20 @@ fn snapshot_from_context(ctx: CurrentPlaybackContext) -> NowPlaying {
                 None,
                 dur,
                 None,
+                None,
             )
         }
         // status コマンドと同じく、Unknown に落ちた生 JSON からフォールバック抽出する。
         Some(PlayableItem::Unknown(v)) => {
             let (title, artists, album, dur) = crate::commands::status::track_from_json(&v);
+            let images = crate::commands::status::album_images_from_json(&v);
             (
                 title,
                 artists,
                 album,
                 dur,
                 crate::commands::status::track_id_from_json(&v),
+                art::pick_image_url(&images),
             )
         }
         None => (
@@ -543,6 +585,7 @@ fn snapshot_from_context(ctx: CurrentPlaybackContext) -> NowPlaying {
             Vec::new(),
             None,
             0,
+            None,
             None,
         ),
     };
@@ -557,6 +600,7 @@ fn snapshot_from_context(ctx: CurrentPlaybackContext) -> NowPlaying {
         device,
         volume,
         track_uri,
+        album_image_url,
         fetched_at: Instant::now(),
     }
 }
@@ -652,6 +696,29 @@ async fn refresh_saved(app: &mut App) {
     app.saved_checked = true;
     if let Ok(mut flags) = app.client.library_contains([LibraryId::Track(id)]).await {
         app.saved = flags.pop();
+    }
+}
+
+/// カバーアートを更新する。現在曲のアート URL が `art_url` と変わったときだけ取得し直す
+/// （曲ごとに 1 回・失敗しても再試行しない＝best-effort）。取得失敗はメタデータ表示を残しつつ
+/// ステータス行に出す（silent failure 禁止）。
+async fn refresh_art(app: &mut App) {
+    let url = app.now.as_ref().and_then(|n| n.album_image_url.clone());
+    if url == app.art_url {
+        return; // 変化なし（同じ曲）→ 再取得しない
+    }
+    // 成否に関わらずこの URL での再取得は打ち止め（毎ポーリング連打を防ぐ）。
+    app.art_url = url.clone();
+    let Some(url) = url else {
+        app.art = None; // アート無し（エピソード等）
+        return;
+    };
+    match art::fetch_decode(&app.http, &url).await {
+        Ok(img) => app.art = Some(app.picker.new_resize_protocol(img)),
+        Err(e) => {
+            app.art = None;
+            app.status = format!("⚠ カバーアートの取得に失敗: {e}");
+        }
     }
 }
 
@@ -940,13 +1007,26 @@ fn install_panic_hook() {
 
 // ---- 描画 -------------------------------------------------------------------
 
-fn draw(frame: &mut ratatui::Frame, app: &App) {
-    match &app.mode {
-        Mode::Normal => draw_now(frame, app),
-        Mode::Search(state) => draw_search(frame, state),
-        Mode::Browse(state) => draw_browse(frame, state),
-        Mode::Devices(state) => draw_devices(frame, state),
-        Mode::Help => draw_help(frame),
+fn draw(frame: &mut ratatui::Frame, app: &mut App) {
+    // ModeKind（Copy）で分岐して借用を即解放する。Normal は画像描画で `&mut app` が要るため。
+    match app.mode.kind() {
+        ModeKind::Normal => draw_now(frame, app),
+        ModeKind::Search => {
+            if let Mode::Search(state) = &app.mode {
+                draw_search(frame, state);
+            }
+        }
+        ModeKind::Browse => {
+            if let Mode::Browse(state) = &app.mode {
+                draw_browse(frame, state);
+            }
+        }
+        ModeKind::Devices => {
+            if let Mode::Devices(state) = &app.mode {
+                draw_devices(frame, state);
+            }
+        }
+        ModeKind::Help => draw_help(frame),
     }
 }
 
@@ -993,14 +1073,33 @@ fn draw_help(frame: &mut ratatui::Frame) {
     );
 }
 
-/// 通常（Now Playing）表示。
-fn draw_now(frame: &mut ratatui::Frame, app: &App) {
+/// 通常（Now Playing）表示。カバーアートがあれば左に画像列、右にテキストを置く。
+fn draw_now(frame: &mut ratatui::Frame, app: &mut App) {
     let area = frame.area();
     let outer = Block::default()
         .borders(Borders::ALL)
         .title(" spoterm — Now Playing ");
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
+
+    // 再生中は左に画像列を割く（アートが無い/取得前でもプレースホルダを出して空状態を明示）。
+    // 画像は正方形なので、セルの縦横比(約1:2)を踏まえ幅 ≒ 高さ*2 を目安にし、内側幅の半分・
+    // 24 桁で頭打ち。狭すぎる場合は列を出さない（テキスト全幅）。無再生時も列を出さない。
+    let want_art_col = app.art.is_some() || app.now.is_some();
+    let art_cols: u16 = if want_art_col {
+        inner.height.saturating_mul(2).min(inner.width / 2).min(24)
+    } else {
+        0
+    };
+    let (art_area, text_area) = if art_cols >= 4 {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(art_cols), Constraint::Min(1)])
+            .split(inner);
+        (Some(cols[0]), cols[1])
+    } else {
+        (None, inner)
+    };
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -1015,7 +1114,7 @@ fn draw_now(frame: &mut ratatui::Frame, app: &App) {
             Constraint::Length(1), // ステータス
             Constraint::Length(1), // フッター（キー）
         ])
-        .split(inner);
+        .split(text_area);
 
     // 表示行の組み立ては純粋関数 `view::render_lines` に委譲（テスト済み）。ここは widget 化のみ。
     let elapsed = app
@@ -1023,7 +1122,12 @@ fn draw_now(frame: &mut ratatui::Frame, app: &App) {
         .as_ref()
         .map(|n| n.fetched_at.elapsed().as_millis())
         .unwrap_or(0);
-    let v = view::render_lines(app.now.as_ref(), elapsed, inner.width as usize, app.saved);
+    let v = view::render_lines(
+        app.now.as_ref(),
+        elapsed,
+        text_area.width as usize,
+        app.saved,
+    );
 
     let bold = Style::default().add_modifier(Modifier::BOLD);
     frame.render_widget(Paragraph::new(v.state).style(bold), rows[0]);
@@ -1061,6 +1165,21 @@ fn draw_now(frame: &mut ratatui::Frame, app: &App) {
             .style(Style::default().add_modifier(Modifier::DIM)),
         rows[8],
     );
+
+    // カバーアート描画（最後に。ここで初めて `&mut app.art` を借りる＝上のテキスト描画の
+    // 不変借用はすべて終わっている）。プロトコルが端末に応じて実画像/半ブロックを出す。
+    // アートが無いとき（エピソード / 画像なし / 取得前・失敗）はプレースホルダで空状態を明示。
+    if let Some(area) = art_area {
+        if let Some(art) = app.art.as_mut() {
+            frame.render_stateful_widget(StatefulImage::default(), area, art);
+        } else {
+            let placeholder = Paragraph::new("♪\n\n(アートなし)")
+                .alignment(Alignment::Center)
+                .style(Style::default().add_modifier(Modifier::DIM))
+                .block(Block::default().borders(Borders::ALL));
+            frame.render_widget(placeholder, area);
+        }
+    }
 }
 
 /// ライブラリ閲覧表示（タブ + 一覧）。
