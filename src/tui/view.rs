@@ -127,6 +127,32 @@ pub fn search_row(name: &str, artists: &str, width: usize) -> String {
     truncate(&text, width.saturating_sub(2))
 }
 
+/// デバイス 1 行を整形する純粋関数（`commands::devices::render_device` の TUI 版）。
+/// アクティブは `● (active)`、非アクティブは `○` で明示し、操作不可は注記する。
+/// 選択記号 `"▶ "` の 2 桁ぶんを差し引いた幅で末尾省略する。
+pub fn device_row(
+    name: &str,
+    type_label: &str,
+    vol: Option<u32>,
+    is_active: bool,
+    is_restricted: bool,
+    width: usize,
+) -> String {
+    let mark = if is_active { "●" } else { "○" };
+    let vol_s = match vol {
+        Some(v) => format!("vol {v}%"),
+        None => "vol -".to_string(),
+    };
+    let mut text = format!("{mark} {name} [{type_label}]  {vol_s}");
+    if is_active {
+        text.push_str("  (active)");
+    }
+    if is_restricted {
+        text.push_str(" (操作不可)");
+    }
+    truncate(&text, width.saturating_sub(2))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +243,36 @@ mod tests {
         let results = search_hint(false, 3);
         assert!(results.starts_with("3 件"));
         assert!(results.contains("Enter 再生"));
+    }
+
+    #[test]
+    fn device_row_active_marks_and_notes() {
+        let out = device_row("MacBook-spotifyd", "Computer", Some(65), true, false, 80);
+        assert!(out.starts_with("● MacBook-spotifyd [Computer]"));
+        assert!(out.contains("vol 65%"));
+        assert!(out.contains("(active)"));
+    }
+
+    #[test]
+    fn device_row_inactive_without_volume() {
+        let out = device_row("Speaker", "Speaker", None, false, false, 80);
+        assert!(out.starts_with("○ Speaker [Speaker]"));
+        assert!(out.contains("vol -"));
+        assert!(!out.contains("(active)"));
+    }
+
+    #[test]
+    fn device_row_restricted_is_annotated() {
+        let out = device_row("TV", "Tv", Some(40), false, true, 80);
+        assert!(out.starts_with("○ TV [Tv]"));
+        assert!(out.contains("(操作不可)"));
+    }
+
+    #[test]
+    fn device_row_truncates_with_symbol_margin() {
+        // width 10 → 記号 2 桁ぶんを引いた 8 文字で末尾省略
+        let out = device_row("abcdefghij", "X", None, false, false, 10);
+        assert_eq!(out.chars().count(), 8);
+        assert!(out.ends_with('…'));
     }
 }
