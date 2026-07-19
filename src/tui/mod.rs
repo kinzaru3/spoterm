@@ -5,6 +5,7 @@
 //!   [`view::interpolate_progress`] で進捗をローカル補間して滑らかに見せる。
 //! - API エラーはステータス行に出してループは継続する（silent failure 禁止）。
 
+mod browse;
 mod view;
 
 use std::io::{self, Stdout};
@@ -45,10 +46,11 @@ const SEARCH_LIMIT: u32 = 10;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
-/// 画面モード。通常は Now Playing、`/` で検索オーバーレイに入る。
+/// 画面モード。通常は Now Playing、`/` で検索、`2` でライブラリ閲覧に入る。
 enum Mode {
     Normal,
     Search(SearchState),
+    Browse(browse::BrowseState),
 }
 
 /// 検索オーバーレイの状態。
@@ -116,7 +118,7 @@ struct App {
     last_poll: Option<Instant>,
     /// 連続ポーリング失敗回数。閾値を超えたら自動更新を止め、手動再試行を促す。
     poll_failures: u32,
-    /// 画面モード（通常 / 検索オーバーレイ）。
+    /// 画面モード（通常 / 検索 / ライブラリ閲覧）。
     mode: Mode,
 }
 
@@ -183,6 +185,9 @@ async fn handle_key(key: KeyEvent, cfg: &Config, app: &mut App) -> bool {
     if matches!(app.mode, Mode::Search(_)) {
         handle_search_key(key, cfg, app).await;
         false
+    } else if matches!(app.mode, Mode::Browse(_)) {
+        handle_browse_key(key, cfg, app).await;
+        false
     } else {
         handle_normal_key(key, cfg, app).await
     }
@@ -193,6 +198,7 @@ async fn handle_normal_key(key: KeyEvent, cfg: &Config, app: &mut App) -> bool {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => return true,
         KeyCode::Char('/') => app.mode = Mode::Search(SearchState::new()),
+        KeyCode::Char('2') => load_browse(cfg, app, browse::BrowseTab::Playlists).await,
         KeyCode::Char(' ') => control_toggle(cfg, app).await,
         KeyCode::Char('n') => control_next(cfg, app).await,
         KeyCode::Char('p') => control_prev(cfg, app).await,
@@ -488,6 +494,74 @@ async fn control_volume(cfg: &Config, app: &mut App, delta: i16) {
     finish(app, c.volume(next, None).await, &format!("🔊 音量 {next}%"));
 }
 
+// ---- ライブラリ閲覧（browse） -----------------------------------------------
+
+/// 閲覧オーバーレイのキー処理。同期で選択を更新し、必要な非同期アクションを実行する。
+async fn handle_browse_key(key: KeyEvent, cfg: &Config, app: &mut App) {
+    let action = {
+        let Mode::Browse(state) = &mut app.mode else {
+            return;
+        };
+        browse::key_action(key, state)
+    };
+    match action {
+        browse::BrowseAction::None => {}
+        browse::BrowseAction::Close => app.mode = Mode::Normal,
+        browse::BrowseAction::Switch(tab) => load_browse(cfg, app, tab).await,
+        browse::BrowseAction::Play => browse_play(cfg, app).await,
+    }
+}
+
+/// 指定タブの一覧を取得して閲覧モードに入る（既に閲覧中ならタブ切替）。失敗は案内する。
+async fn load_browse(cfg: &Config, app: &mut App, tab: browse::BrowseTab) {
+    match browse::fetch(cfg, tab).await {
+        Ok(items) => {
+            let message = items
+                .is_empty()
+                .then(|| format!("{} は空です", tab.label()));
+            app.mode = Mode::Browse(browse::BrowseState {
+                tab,
+                items,
+                selected: 0,
+                message,
+            });
+        }
+        Err(e) => {
+            // 閲覧中なら画面に留めてメッセージ表示、通常表示中ならステータス行へ。
+            if let Mode::Browse(state) = &mut app.mode {
+                state.message = Some(format!("取得に失敗しました: {e}"));
+            } else {
+                app.status = format!("⚠ ライブラリの取得に失敗: {e}");
+            }
+        }
+    }
+}
+
+/// 選択項目を再生する。成功で通常表示へ戻り、失敗はオーバーレイにメッセージを残す。
+async fn browse_play(cfg: &Config, app: &mut App) {
+    let target = match &app.mode {
+        Mode::Browse(state) => state.items.get(state.selected).map(|it| it.target.clone()),
+        _ => None,
+    };
+    let Some(target) = target else {
+        return;
+    };
+    match browse::play(cfg, &target).await {
+        Ok(()) => {
+            app.status = "▶ 再生を開始しました".to_string();
+            app.last_poll = None;
+            app.mode = Mode::Normal;
+        }
+        Err(e) => {
+            if let Mode::Browse(state) = &mut app.mode {
+                state.message = Some(format!("再生に失敗しました: {e}"));
+            } else {
+                app.status = format!("⚠ 再生に失敗: {e}");
+            }
+        }
+    }
+}
+
 // ---- 端末制御 ---------------------------------------------------------------
 
 fn setup_terminal() -> Result<Term> {
@@ -532,6 +606,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     match &app.mode {
         Mode::Normal => draw_now(frame, app),
         Mode::Search(state) => draw_search(frame, state),
+        Mode::Browse(state) => draw_browse(frame, state),
     }
 }
 
@@ -582,10 +657,78 @@ fn draw_now(frame: &mut ratatui::Frame, app: &App) {
     frame.render_widget(Paragraph::new(v.device), rows[5]);
     frame.render_widget(Paragraph::new(app.status.clone()), rows[7]);
     frame.render_widget(
-        Paragraph::new("space ⏯   n ⏭   p ⏮   +/- 音量   / 検索   r 更新   q 終了")
+        Paragraph::new("space ⏯   n ⏭   p ⏮   +/- 音量   / 検索   2 ライブラリ   r 更新   q 終了")
             .alignment(Alignment::Center)
             .style(Style::default().add_modifier(Modifier::DIM)),
         rows[8],
+    );
+}
+
+/// ライブラリ閲覧表示（タブ + 一覧）。
+fn draw_browse(frame: &mut ratatui::Frame, state: &browse::BrowseState) {
+    let area = frame.area();
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(" spoterm — ライブラリ ");
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // タブ見出し
+            Constraint::Length(1), // 補足
+            Constraint::Min(1),    // 一覧
+            Constraint::Length(1), // フッター
+        ])
+        .split(inner);
+
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+
+    // タブ見出し（現在タブを [ ] で囲う）。
+    let header = browse::BrowseTab::ALL
+        .iter()
+        .map(|t| {
+            if *t == state.tab {
+                format!("[{}]", t.label())
+            } else {
+                format!(" {} ", t.label())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    frame.render_widget(Paragraph::new(header).style(bold), rows[0]);
+
+    let hint = state.message.clone().unwrap_or_else(|| {
+        format!(
+            "{} 件 — ↑↓ 選択 / ←→ タブ / Enter 再生 / Esc 戻る",
+            state.items.len()
+        )
+    });
+    frame.render_widget(Paragraph::new(hint).style(dim), rows[1]);
+
+    // 一覧（title — subtitle。行整形は検索と共通の純粋関数を再利用）。
+    let width = inner.width as usize;
+    let items: Vec<ListItem> = state
+        .items
+        .iter()
+        .map(|it| ListItem::new(view::search_row(&it.title, &it.subtitle, width)))
+        .collect();
+    let mut list_state = ListState::default();
+    if !state.items.is_empty() {
+        list_state.select(Some(state.selected));
+    }
+    let list = List::new(items)
+        .highlight_symbol("▶ ")
+        .highlight_style(bold);
+    frame.render_stateful_widget(list, rows[2], &mut list_state);
+
+    frame.render_widget(
+        Paragraph::new("↑↓ 選択   ←→ タブ   Enter 再生   Esc 戻る   Ctrl-C 終了")
+            .alignment(Alignment::Center)
+            .style(dim),
+        rows[3],
     );
 }
 
