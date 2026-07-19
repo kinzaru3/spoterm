@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod format;
 mod match_name;
+mod tui;
 
 use anyhow::Result;
 use clap::Parser;
@@ -37,6 +38,7 @@ async fn main() -> Result<()> {
             PlaylistAction::Play { name } => commands::playlist::play(&cfg, &name).await?,
         },
         Command::Lib => commands::lib::run(&cfg).await?,
+        Command::Tui => tui::run(&cfg).await?,
     }
 
     Ok(())

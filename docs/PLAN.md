@@ -136,8 +136,17 @@ spoterm lib               # 保存済みトラック/アルバム一覧・再生
       `page.items` の move を借用化・該当なし文言を純粋関数 `no_match_message` に抽出しテスト追加）
 - [ ] 実 API 動作確認（[manual-tests.md](./manual-tests.md) の Phase 5 手順）— **ユーザー実機で実施予定**
 
-### Phase 6 — TUI 化
-- [ ] `ratatui` で Now Playing 画面・検索・選曲・キー操作
+### Phase 6 — TUI 化（Now Playing ダッシュボード）🚧
+初回スコープは「段階的」方針に沿って **Now Playing 中心**（検索/選曲は後続に回す）。
+- [x] `spoterm tui`：`ratatui` + `crossterm` で Now Playing をライブ表示（`src/tui/`）
+  - 曲名/アーティスト/アルバム/進捗ゲージ/デバイス/音量を表示。認証は既存 `auth::authed_client` を再利用。
+  - `POLL_INTERVAL=2s` で `current_playback` を再取得、合間は `view::interpolate_progress` でローカル補間。
+  - キー操作：`space`=トグル / `n`=次 / `p`=前 / `+`,`-`=音量±5 / `r`=更新 / `q`,`Esc`,`Ctrl-C`=終了。
+  - パニックフックで端末復元、API エラーはステータス行に出してループ継続（silent failure 禁止）。
+  - `Unknown` トラックのフォールバックは `status::track_from_json` を crate 内共有して再利用（DRY）。
+- [x] `fmt`/`clippy -D warnings` 通過、単体テスト 39 件（TUI 純粋関数 3 件追加）
+- [ ] 実端末での実 API 動作確認（[manual-tests.md](./manual-tests.md) の Phase 6 手順）— **ユーザー実機で実施予定**
+- [ ] 後続候補：検索/選曲オーバーレイ、プレイリスト/ライブラリ閲覧、デバイス切替タブ
 
 ### Phase 7 — テスト & 配布
 - [ ] `wiremock` で API モックの単体テスト、CI（GitHub Actions）

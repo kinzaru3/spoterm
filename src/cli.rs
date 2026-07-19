@@ -52,6 +52,8 @@ pub enum Command {
     },
     /// ライブラリ（保存済みトラック/アルバム）
     Lib,
+    /// 対話型 TUI（Now Playing ダッシュボード）
+    Tui,
 }
 
 #[derive(Subcommand, Debug)]
