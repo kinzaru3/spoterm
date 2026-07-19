@@ -1,20 +1,20 @@
-# spoterm
+# spotterm
 
 **English** | [日本語](README.ja.md)
 
 A fast Spotify CLI & TUI for your terminal, built on the official Spotify Web API.
 
-spoterm controls playback, searches, browses your library, and shows a live "Now Playing"
+spotterm controls playback, searches, browses your library, and shows a live "Now Playing"
 dashboard (with **album cover art** in supporting terminals). It uses **Authorization Code + PKCE**
 (no client secret on your machine) and talks only to the official Web API — it never downloads
 audio or bundles any Spotify SDK.
 
 Playback happens on any **Spotify Connect device** you already run (the official Spotify desktop
-or mobile app); spoterm just tells that device what to play.
+or mobile app); spotterm just tells that device what to play.
 
 ## Features
 
-- **Now Playing TUI** (`spoterm tui`): live track/artist/album, progress bar, volume, and **cover art**.
+- **Now Playing TUI** (`spotterm tui`): live track/artist/album, progress bar, volume, and **cover art**.
 - **Playback control**: play / pause / next / prev / seek / volume, from the CLI or the TUI.
 - **Search & play** tracks.
 - **Browse & play** your playlists, saved tracks, and saved albums.
@@ -35,20 +35,20 @@ or mobile app); spoterm just tells that device what to play.
 
 ### Prebuilt binaries
 
-Download a tarball for your platform from the [Releases](https://github.com/kinzaru3/spoterm/releases)
-page (Linux `x86_64`, macOS `aarch64`/`x86_64`), then extract and put `spoterm` on your `PATH`:
+Download a tarball for your platform from the [Releases](https://github.com/kinzaru3/spotterm/releases)
+page (Linux `x86_64`, macOS `aarch64`/`x86_64`), then extract and put `spotterm` on your `PATH`:
 
 ```sh
-tar xzf spoterm-*.tar.gz
-sudo mv spoterm-*/spoterm /usr/local/bin/
+tar xzf spotterm-*.tar.gz
+sudo mv spotterm-*/spotterm /usr/local/bin/
 ```
 
 ### Build from source
 
 ```sh
-cargo install --git https://github.com/kinzaru3/spoterm
+cargo install --git https://github.com/kinzaru3/spotterm
 # or
-git clone https://github.com/kinzaru3/spoterm && cd spoterm && cargo install --path .
+git clone https://github.com/kinzaru3/spotterm && cd spotterm && cargo install --path .
 ```
 
 ## Setup
@@ -67,11 +67,11 @@ git clone https://github.com/kinzaru3/spoterm && cd spoterm && cargo install --p
    ```
 4. **Log in** (opens your browser for consent; the token is cached locally):
    ```sh
-   spoterm login
+   spotterm login
    ```
 
 > **Why your own Client ID?** Spotify's development mode limits an app to a small number of
-> users, so each user runs spoterm with their own registered app. No client secret is needed
+> users, so each user runs spotterm with their own registered app. No client secret is needed
 > (PKCE), and your token is stored in your OS config directory with `0600` permissions.
 
 ## Usage
@@ -79,22 +79,22 @@ git clone https://github.com/kinzaru3/spoterm && cd spoterm && cargo install --p
 ### One-shot commands
 
 ```sh
-spoterm status                 # Now Playing (track / artist / progress / device)
-spoterm search <query>         # search tracks/albums/artists
-spoterm play [query]           # resume, or search and play
-spoterm pause | next | prev | toggle
-spoterm vol <0-100>            # set volume
-spoterm devices                # list available Connect devices
-spoterm device use <name>      # transfer playback to a device
-spoterm playlist ls            # list your playlists
-spoterm playlist play <name>   # play a playlist by name
-spoterm lib                    # list saved tracks / albums
+spotterm status                 # Now Playing (track / artist / progress / device)
+spotterm search <query>         # search tracks/albums/artists
+spotterm play [query]           # resume, or search and play
+spotterm pause | next | prev | toggle
+spotterm vol <0-100>            # set volume
+spotterm devices                # list available Connect devices
+spotterm device use <name>      # transfer playback to a device
+spotterm playlist ls            # list your playlists
+spotterm playlist play <name>   # play a playlist by name
+spotterm lib                    # list saved tracks / albums
 ```
 
 ### Interactive TUI
 
 ```sh
-spoterm tui
+spotterm tui
 ```
 
 | Key | Action |
@@ -125,7 +125,7 @@ set -g allow-passthrough on
 
 ## Notes
 
-- **Personal, non-commercial use.** spoterm is a client of the public Spotify Web API; it does not
+- **Personal, non-commercial use.** spotterm is a client of the public Spotify Web API; it does not
   redistribute any Spotify SDK, content, or client secret.
 - Cover art and track metadata are shown together, per Spotify's developer guidelines.
 

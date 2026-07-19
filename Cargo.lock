@@ -2579,8 +2579,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "spoterm"
-version = "0.1.1"
+name = "spotterm"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",

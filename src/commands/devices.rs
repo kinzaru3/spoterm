@@ -1,4 +1,4 @@
-//! `spoterm devices`: list the available Spotify Connect devices.
+//! `spotterm devices`: list the available Spotify Connect devices.
 
 use anyhow::{Context, Result};
 use rspotify::AuthCodePkceSpotify;

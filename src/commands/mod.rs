@@ -12,4 +12,4 @@ pub mod status;
 
 /// Hint shown when an operation that requires an active device fails (shared by playback / playlist).
 pub(crate) const NEED_DEVICE_HINT: &str =
-    "(An active device is required. Select one with `spoterm device use <name>`.)";
+    "(An active device is required. Select one with `spotterm device use <name>`.)";

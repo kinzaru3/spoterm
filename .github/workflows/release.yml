@@ -42,9 +42,9 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          staging="spoterm-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          staging="spotterm-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$staging"
-          cp "target/${{ matrix.target }}/release/spoterm" "$staging/"
+          cp "target/${{ matrix.target }}/release/spotterm" "$staging/"
           cp LICENSE README.md "$staging/"
           tar czf "$staging.tar.gz" "$staging"
           echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
@@ -53,3 +53,102 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.ASSET }}
+
+  # Publish the crate to crates.io. Requires the CARGO_REGISTRY_TOKEN secret.
+  publish-crate:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fail early if the pushed tag doesn't match the version in Cargo.toml.
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate_ver="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "$tag" != "$crate_ver" ]; then
+            echo "::error::tag v$tag does not match Cargo.toml version $crate_ver"
+            exit 1
+          fi
+
+      - name: Publish
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Regenerate the Homebrew formula from the uploaded prebuilt binaries and
+  # push it to the tap repo. Requires the HOMEBREW_TAP_TOKEN secret (a PAT with
+  # write access to kinzaru3/homebrew-tap).
+  homebrew:
+    name: Update Homebrew tap
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate and push formula
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          repo="kinzaru3/spotterm"
+          tap="kinzaru3/homebrew-tap"
+          base="https://github.com/${repo}/releases/download/${tag}"
+
+          arm="spotterm-${tag}-aarch64-apple-darwin.tar.gz"
+          intel="spotterm-${tag}-x86_64-apple-darwin.tar.gz"
+          linux="spotterm-${tag}-x86_64-unknown-linux-gnu.tar.gz"
+
+          # Download the just-published assets and compute their checksums.
+          mkdir -p dist
+          for f in "$arm" "$intel" "$linux"; do
+            gh release download "$tag" -R "$repo" -p "$f" -D dist
+          done
+          arm_sha="$(sha256sum "dist/$arm"   | cut -d' ' -f1)"
+          intel_sha="$(sha256sum "dist/$intel" | cut -d' ' -f1)"
+          linux_sha="$(sha256sum "dist/$linux" | cut -d' ' -f1)"
+
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/${tap}.git" tap
+          mkdir -p tap/Formula
+          cat > tap/Formula/spotterm.rb <<EOF
+          class Spotterm < Formula
+            desc "CLI/TUI to control Spotify (official Web API, PKCE auth)"
+            homepage "https://github.com/${repo}"
+            version "${version}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "${base}/${arm}"
+                sha256 "${arm_sha}"
+              end
+              on_intel do
+                url "${base}/${intel}"
+                sha256 "${intel_sha}"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "${base}/${linux}"
+                sha256 "${linux_sha}"
+              end
+            end
+
+            def install
+              bin.install "spotterm"
+            end
+
+            test do
+              assert_match "spotterm", shell_output("#{bin}/spotterm --version")
+            end
+          end
+          EOF
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/spotterm.rb
+          git commit -m "spotterm ${version}"
+          git push

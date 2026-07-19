@@ -98,7 +98,7 @@ async fn exec_toggle(spotify: &AuthCodePkceSpotify) -> Result<String> {
                 .context("failed to resume playback")?;
             "▶ Resumed playback".to_string()
         }
-        None => "No active device. Select one with `spoterm device use <name>`".to_string(),
+        None => "No active device. Select one with `spotterm device use <name>`".to_string(),
     };
     Ok(msg)
 }

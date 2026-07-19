@@ -1,4 +1,4 @@
-//! `spoterm search <query>`: search tracks / albums / artists and list the results.
+//! `spotterm search <query>`: search tracks / albums / artists and list the results.
 
 use anyhow::{Context, Result};
 use rspotify::AuthCodePkceSpotify;
