@@ -33,7 +33,17 @@ or mobile app); spoterm just tells that device what to play.
 
 ## Install
 
-Build from source (until published to crates.io):
+### Prebuilt binaries
+
+Download a tarball for your platform from the [Releases](https://github.com/kinzaru3/spoterm/releases)
+page (Linux `x86_64`, macOS `aarch64`/`x86_64`), then extract and put `spoterm` on your `PATH`:
+
+```sh
+tar xzf spoterm-*.tar.gz
+sudo mv spoterm-*/spoterm /usr/local/bin/
+```
+
+### Build from source
 
 ```sh
 cargo install --git https://github.com/kinzaru3/spoterm
