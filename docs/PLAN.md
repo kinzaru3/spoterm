@@ -150,11 +150,17 @@ spoterm lib               # 保存済みトラック/アルバム一覧・再生
 - [x] `fmt`/`clippy -D warnings` 通過、単体テスト 41 件（TUI 純粋関数 5 件追加）
 - [x] 実端末での実 API 動作確認（[manual-tests.md](./manual-tests.md) の Phase 6 手順）— **ユーザー実機で確認済み（2026-07-19）**
 
-#### Phase 6.1 — 検索して再生（Search overlay）
-- [ ] `/` で検索入力モード → クエリ入力 → `search`（Track）を叩いて結果リスト表示（既存 `search` API 再利用）
-- [ ] `↑`/`↓` で候補選択、`Enter` で `start_uris_playback` 再生、`Esc` で Now Playing へ戻る
-- [ ] 入力状態（IME/バックスペース/空クエリ）と 0 ヒット時のメッセージを整理（silent failure 禁止）
-- [ ] 選択・整形は純粋関数化して単体テスト（`render_result_row` 等）
+#### Phase 6.1 — 検索して再生（Search overlay）✅
+- [x] `/` で検索入力モード → クエリ入力 → `search`（Track・上限10）で結果リスト表示（既存 `search` API 再利用）
+- [x] `↑`/`↓` で候補選択、`Enter` で `start_uris_playback` 再生、`Esc` で入力へ戻る/オーバーレイを閉じる
+  - モードは `Mode::{Normal, Search}`、検索は `Input`/`Results` の 2 フェーズ。キー処理は同期で
+    クエリ/選択を更新し `SearchAction` を返す→本体が非同期実行（借用競合を回避）。
+  - 再生可能な（URI あり）トラックのみ候補化（`track_to_hit`）。Ctrl-C は全モードで終了。
+- [x] 空クエリは無視、0 ヒット・検索失敗はメッセージ表示（silent failure 禁止）
+- [x] 行整形/補足文言は純粋関数 `view::search_row` / `view::search_hint` に切り出して単体テスト、`fmt`/`clippy -D warnings` 通過、単体テスト 44 件
+- [x] ECC rust-reviewer 反映：再生失敗をオーバーレイ内メッセージで表示（`play_uri`/`play_track` 分離で silent failure 解消）・
+      入力へ戻る際に古い結果/選択をクリア・補足文言を純粋関数化
+- [ ] 実端末での実 API 動作確認（[manual-tests.md](./manual-tests.md) の Phase 6.1 手順）— **ユーザー実機で実施予定**
 
 #### Phase 6.2 — ライブラリ / プレイリスト閲覧・再生（Browse view）
 - [ ] ビュー切替（例 `1`=Now / `2`=Library / `3`=Playlists、または `l`/`o`）でリスト画面へ
@@ -204,6 +210,5 @@ spoterm lib               # 保存済みトラック/アルバム一覧・再生
     `transfer_playback` で実装できる見込み。
 
 ## 次の一手
-Phase 6.0（Now Playing ダッシュボード）は実装・自動テスト・ユーザー実機確認まで完了（2026-07-19）。
-次は Phase 6.1（検索して再生）に着手する。以降 6.2〜6.5 をサブフェーズ単位の小さな PR で順次追加していく
-（優先度は要望に応じて調整可）。
+Phase 6.0（Now Playing）・6.1（検索して再生）は実装・自動テスト完了。6.1 は残りユーザー実機での実 API 確認
+（[manual-tests.md](./manual-tests.md) の Phase 6.1 手順）。確認後、Phase 6.2（ライブラリ/プレイリスト閲覧）に着手する。

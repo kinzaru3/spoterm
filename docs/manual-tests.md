@@ -96,6 +96,22 @@ docker compose exec dev bash -lc 'cd /workspace && cargo run -q -- tui'
 - API エラー（アクティブデバイス無し等）はステータス行に `⚠ …` で出て、TUI は落ちない。
 - 終了後、ターミナルは元の画面・カーソルに正しく戻る。
 
+### Phase 6.1 — 検索して再生（Search overlay）
+
+TUI 起動後（前項と同じく TTY 必須）、Now Playing 画面で操作する。
+
+- `/` を押す → 検索入力モード（`検索: ▌`）。
+- クエリを入力（例 `daft punk`）して `Enter` → トラック候補が最大 10 件出る。
+- `↑`/`↓` で選択、`Enter` で再生（アクティブデバイスが必要）。
+- `Esc`（結果画面）→ クエリ修正へ戻る。`Esc`（入力画面）→ Now Playing へ戻る。
+- `Ctrl-C` はどの画面でも終了。
+
+期待:
+- 再生を選ぶと Now Playing に戻り、選んだ曲が再生される（`▶ 再生を開始しました`）。
+- ヒット 0 → 「"…" に一致するトラックはありませんでした」。空クエリで `Enter` は無反応。
+- アクティブデバイス未選択で再生すると、ステータス行に `⚠ 操作に失敗: …` が出る（先に `device use` するか Now Playing で用意）。
+- 検索中も裏で Now Playing のポーリングは継続（戻ると最新表示）。
+
 ## 既知の挙動・注意
 
 - **`status` の曲情報**: Spotify の `/me/player` はトラックに `external_ids` を含めず、rspotify 0.16.1 の
