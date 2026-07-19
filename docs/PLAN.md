@@ -175,10 +175,16 @@ spoterm lib               # 保存済みトラック/アルバム一覧・再生
 - [x] `fmt`/`clippy -D warnings` 通過、単体テスト 44 件
 - [ ] 実端末での実 API 動作確認（[manual-tests.md](./manual-tests.md) の Phase 6.2 手順）— **ユーザー実機で実施予定**
 
-#### Phase 6.3 — デバイス選択（Device picker）
-- [ ] `d` でデバイス一覧オーバーレイ（`devices` 再利用）、`Enter` で `transfer_playback`（spotifyd 等へ）
-- [ ] アクティブデバイスの明示（`● (active)`）、転送後に即ポーリングして反映
-- [ ] アクティブ無し時の操作（再生/音量）の導線を改善
+#### Phase 6.3 — デバイス選択（Device picker）✅
+- [x] `d` でデバイス一覧オーバーレイ（新モジュール `src/tui/devices.rs`・`devices` コマンドと同じ `device()` 再利用）、
+      `Enter` で `transfer_playback(id, Some(true))`（spotifyd 等へ）。キー処理は同期で選択更新→`DeviceAction` を返し
+      本体が非同期実行（`browse`/`search` と同じ借用回避パターン）。デバイスは出入りするためキャッシュしない。
+- [x] アクティブデバイスの明示（`● (active)`／非アクティブ `○`）。行整形は純粋関数 `view::device_row` に切り出して
+      単体テスト。転送成功で `last_poll=None` にして即ポーリング → Now Playing のデバイス行へ反映。
+- [x] アクティブ無し時の操作（再生/音量）失敗時に「d でデバイスを選択」と案内。操作不可/ID 無しデバイスは
+      転送前に弾いてメッセージ表示（silent failure 禁止）。空一覧・取得失敗・転送失敗も補足行に表示。
+- [x] `fmt`/`clippy -D warnings`／`cargo test`（`device_row` 4 件追加、48 件）・ECC rust-reviewer 反映（0 CRITICAL/HIGH）
+- [x] 実端末での実 API 動作確認（[manual-tests.md](./manual-tests.md) の Phase 6.3 手順）— **ユーザー実機で確認済み（2026-07-19）**
 
 #### Phase 6.4 — シーク & 現在曲のお気に入り（Seek + save）
 - [ ] `←`/`→` で 5〜10 秒シーク（`seek_track`）。進捗ゲージは補間ではなく即時反映
@@ -217,5 +223,5 @@ spoterm lib               # 保存済みトラック/アルバム一覧・再生
     `transfer_playback` で実装できる見込み。
 
 ## 次の一手
-Phase 6.0（Now Playing）・6.1（検索）・6.2（ライブラリ閲覧）は実装・自動テスト完了。6.2 は残りユーザー実機での
-実 API 確認（[manual-tests.md](./manual-tests.md) の Phase 6.2 手順）。確認後、Phase 6.3（デバイス選択）に着手する。
+Phase 6.0（Now Playing）・6.1（検索）・6.2（ライブラリ閲覧）・6.3（デバイス選択）は実装・自動テスト・
+実機確認まで完了。次は Phase 6.4（シーク & 現在曲のお気に入り）に着手する。

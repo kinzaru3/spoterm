@@ -8,6 +8,7 @@
 //! - API エラーはステータス行に出してループは継続する（silent failure 禁止）。
 
 mod browse;
+mod devices;
 mod view;
 
 use std::io::{self, Stdout};
@@ -48,11 +49,12 @@ const SEARCH_LIMIT: u32 = 10;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
-/// 画面モード。通常は Now Playing、`/` で検索、`2` でライブラリ閲覧に入る。
+/// 画面モード。通常は Now Playing、`/` で検索、`2` でライブラリ閲覧、`d` でデバイス選択に入る。
 enum Mode {
     Normal,
     Search(SearchState),
     Browse(browse::BrowseState),
+    Devices(devices::DevicePickerState),
 }
 
 /// 検索オーバーレイの状態。
@@ -198,6 +200,9 @@ async fn handle_key(key: KeyEvent, app: &mut App) -> bool {
     } else if matches!(app.mode, Mode::Browse(_)) {
         handle_browse_key(key, app).await;
         false
+    } else if matches!(app.mode, Mode::Devices(_)) {
+        handle_devices_key(key, app).await;
+        false
     } else {
         handle_normal_key(key, app).await
     }
@@ -209,6 +214,7 @@ async fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
         KeyCode::Char('q') | KeyCode::Esc => return true,
         KeyCode::Char('/') => app.mode = Mode::Search(SearchState::new()),
         KeyCode::Char('2') => load_browse(app, browse::BrowseTab::Playlists).await,
+        KeyCode::Char('d') => open_devices(app).await,
         KeyCode::Char(' ') => control_toggle(app).await,
         KeyCode::Char('n') => control_next(app).await,
         KeyCode::Char('p') => control_prev(app).await,
@@ -463,7 +469,7 @@ fn finish<E: std::fmt::Display>(app: &mut App, res: Result<(), E>, ok: &str) {
             app.last_poll = None; // 変更を素早く画面へ反映
         }
         Err(e) => {
-            app.status = format!("⚠ 操作に失敗: {e}（アクティブなデバイスが必要かもしれません）");
+            app.status = format!("⚠ 操作に失敗: {e}（d でデバイスを選択して有効化してください）");
         }
     }
 }
@@ -501,7 +507,7 @@ async fn control_prev(app: &mut App) {
 
 async fn control_volume(app: &mut App, delta: i16) {
     let Some(cur) = app.now.as_ref().and_then(|n| n.volume) else {
-        app.status = "⚠ デバイス音量が取得できません".to_string();
+        app.status = "⚠ デバイス音量が取得できません（d でデバイスを選択してください）".to_string();
         return;
     };
     let next = (cur as i16 + delta).clamp(0, 100) as u8;
@@ -599,6 +605,90 @@ async fn browse_play(app: &mut App) {
     }
 }
 
+// ---- デバイス選択（device picker） ------------------------------------------
+
+/// デバイス選択オーバーレイのキー処理。同期で選択を更新し、必要な非同期アクションを実行する。
+async fn handle_devices_key(key: KeyEvent, app: &mut App) {
+    let action = {
+        let Mode::Devices(state) = &mut app.mode else {
+            return;
+        };
+        devices::key_action(key, state)
+    };
+    match action {
+        devices::DeviceAction::None => {}
+        devices::DeviceAction::Close => app.mode = Mode::Normal,
+        devices::DeviceAction::Transfer => devices_transfer(app).await,
+        devices::DeviceAction::Reload => open_devices(app).await,
+    }
+}
+
+/// デバイス一覧を取得して選択モードに入る。空一覧・取得失敗は案内する（silent failure 禁止）。
+/// デバイスは出入りするためキャッシュせず、開くたびに取り直す。
+async fn open_devices(app: &mut App) {
+    let items = match devices::fetch(&app.client).await {
+        Ok(items) => items,
+        Err(e) => {
+            // 選択中なら画面に留めてメッセージ表示、通常表示中ならステータス行へ。
+            if let Mode::Devices(state) = &mut app.mode {
+                state.message = Some(format!("取得に失敗しました: {e}"));
+            } else {
+                app.status = format!("⚠ デバイス一覧の取得に失敗: {e}");
+            }
+            return;
+        }
+    };
+    let message = items.is_empty().then(|| {
+        "再生可能なデバイスがありません。Spotify アプリまたは spotifyd を起動してください"
+            .to_string()
+    });
+    // 再取得時に選択が範囲外へずれないよう、アクティブ位置（無ければ先頭）に寄せる。
+    let selected = items.iter().position(|d| d.is_active).unwrap_or(0);
+    app.mode = Mode::Devices(devices::DevicePickerState {
+        items,
+        selected,
+        message,
+    });
+}
+
+/// 選択デバイスへ再生を転送する。成功で通常表示へ戻り即ポーリング、失敗はオーバーレイに残す。
+/// 転送不可（ID なし / 操作不可）は事前に弾いてメッセージで伝える。
+async fn devices_transfer(app: &mut App) {
+    let target = match &app.mode {
+        Mode::Devices(state) => state.items.get(state.selected).cloned(),
+        _ => None,
+    };
+    let Some(target) = target else {
+        return;
+    };
+    if target.is_restricted {
+        if let Mode::Devices(state) = &mut app.mode {
+            state.message = Some(format!("'{}' は操作不可のため転送できません", target.name));
+        }
+        return;
+    }
+    let Some(id) = target.id.as_deref() else {
+        if let Mode::Devices(state) = &mut app.mode {
+            state.message = Some(format!("'{}' は ID がなく転送できません", target.name));
+        }
+        return;
+    };
+    match devices::transfer(&app.client, id).await {
+        Ok(()) => {
+            app.status = format!("▶ '{}' へ再生を移しました", target.name);
+            app.last_poll = None; // 転送を素早く Now Playing へ反映
+            app.mode = Mode::Normal;
+        }
+        Err(e) => {
+            if let Mode::Devices(state) = &mut app.mode {
+                state.message = Some(format!("転送に失敗しました: {e}"));
+            } else {
+                app.status = format!("⚠ 転送に失敗: {e}");
+            }
+        }
+    }
+}
+
 // ---- 端末制御 ---------------------------------------------------------------
 
 fn setup_terminal() -> Result<Term> {
@@ -644,6 +734,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
         Mode::Normal => draw_now(frame, app),
         Mode::Search(state) => draw_search(frame, state),
         Mode::Browse(state) => draw_browse(frame, state),
+        Mode::Devices(state) => draw_devices(frame, state),
     }
 }
 
@@ -694,9 +785,11 @@ fn draw_now(frame: &mut ratatui::Frame, app: &App) {
     frame.render_widget(Paragraph::new(v.device), rows[5]);
     frame.render_widget(Paragraph::new(app.status.clone()), rows[7]);
     frame.render_widget(
-        Paragraph::new("space ⏯   n ⏭   p ⏮   +/- 音量   / 検索   2 ライブラリ   r 更新   q 終了")
-            .alignment(Alignment::Center)
-            .style(Style::default().add_modifier(Modifier::DIM)),
+        Paragraph::new(
+            "space ⏯   n ⏭   p ⏮   +/- 音量   / 検索   2 ライブラリ   d デバイス   r 更新   q 終了",
+        )
+        .alignment(Alignment::Center)
+        .style(Style::default().add_modifier(Modifier::DIM)),
         rows[8],
     );
 }
@@ -766,6 +859,68 @@ fn draw_browse(frame: &mut ratatui::Frame, state: &browse::BrowseState) {
             .alignment(Alignment::Center)
             .style(dim),
         rows[3],
+    );
+}
+
+/// デバイス選択表示（一覧 + 選択強調）。
+fn draw_devices(frame: &mut ratatui::Frame, state: &devices::DevicePickerState) {
+    let area = frame.area();
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(" spoterm — デバイス ");
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // 補足
+            Constraint::Min(1),    // 一覧
+            Constraint::Length(1), // フッター
+        ])
+        .split(inner);
+
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+
+    let hint = state.message.clone().unwrap_or_else(|| {
+        format!(
+            "{} 台 — ↑↓ 選択 / Enter 転送 / r 更新 / Esc 戻る",
+            state.items.len()
+        )
+    });
+    frame.render_widget(Paragraph::new(hint).style(dim), rows[0]);
+
+    // 一覧（デバイス行整形は純粋関数 `view::device_row` に委譲）。
+    let width = inner.width as usize;
+    let items: Vec<ListItem> = state
+        .items
+        .iter()
+        .map(|d| {
+            ListItem::new(view::device_row(
+                &d.name,
+                &d.type_label,
+                d.volume,
+                d.is_active,
+                d.is_restricted,
+                width,
+            ))
+        })
+        .collect();
+    let mut list_state = ListState::default();
+    if !state.items.is_empty() {
+        list_state.select(Some(state.selected));
+    }
+    let list = List::new(items)
+        .highlight_symbol("▶ ")
+        .highlight_style(bold);
+    frame.render_stateful_widget(list, rows[1], &mut list_state);
+
+    frame.render_widget(
+        Paragraph::new("↑↓ 選択   Enter 転送   r 更新   Esc 戻る   Ctrl-C 終了")
+            .alignment(Alignment::Center)
+            .style(dim),
+        rows[2],
     );
 }
 
