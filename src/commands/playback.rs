@@ -2,6 +2,7 @@
 //! When no device is selected (none active), prompt the user to run `device use`.
 
 use anyhow::{Context, Result};
+use rspotify::AuthCodePkceSpotify;
 use rspotify::model::{PlayableId, SearchResult, SearchType};
 use rspotify::prelude::*;
 
@@ -12,84 +13,106 @@ use crate::format::join_artists;
 
 pub async fn pause(cfg: &Config) -> Result<()> {
     let spotify = auth::authed_client(cfg).await?;
+    println!("{}", exec_pause(&spotify).await?);
+    Ok(())
+}
+
+async fn exec_pause(spotify: &AuthCodePkceSpotify) -> Result<String> {
     spotify
         .pause_playback(None)
         .await
         .with_context(|| format!("failed to pause{NEED_DEVICE_HINT}"))?;
-    println!("⏸ Paused");
-    Ok(())
+    Ok("⏸ Paused".to_string())
 }
 
 pub async fn next(cfg: &Config) -> Result<()> {
     let spotify = auth::authed_client(cfg).await?;
+    println!("{}", exec_next(&spotify).await?);
+    Ok(())
+}
+
+async fn exec_next(spotify: &AuthCodePkceSpotify) -> Result<String> {
     spotify
         .next_track(None)
         .await
         .with_context(|| format!("failed to skip to the next track{NEED_DEVICE_HINT}"))?;
-    println!("⏭ Next track");
-    Ok(())
+    Ok("⏭ Next track".to_string())
 }
 
 pub async fn prev(cfg: &Config) -> Result<()> {
     let spotify = auth::authed_client(cfg).await?;
+    println!("{}", exec_prev(&spotify).await?);
+    Ok(())
+}
+
+async fn exec_prev(spotify: &AuthCodePkceSpotify) -> Result<String> {
     spotify
         .previous_track(None)
         .await
         .with_context(|| format!("failed to skip to the previous track{NEED_DEVICE_HINT}"))?;
-    println!("⏮ Previous track");
-    Ok(())
+    Ok("⏮ Previous track".to_string())
 }
 
 pub async fn vol(cfg: &Config, level: u8) -> Result<()> {
     let spotify = auth::authed_client(cfg).await?;
+    println!("{}", exec_vol(&spotify, level).await?);
+    Ok(())
+}
+
+async fn exec_vol(spotify: &AuthCodePkceSpotify, level: u8) -> Result<String> {
     spotify
         .volume(level, None)
         .await
         .with_context(|| format!("failed to set volume{NEED_DEVICE_HINT}"))?;
-    println!("🔊 Volume set to {level}%");
-    Ok(())
+    Ok(format!("🔊 Volume set to {level}%"))
 }
 
 pub async fn toggle(cfg: &Config) -> Result<()> {
     let spotify = auth::authed_client(cfg).await?;
+    println!("{}", exec_toggle(&spotify).await?);
+    Ok(())
+}
+
+async fn exec_toggle(spotify: &AuthCodePkceSpotify) -> Result<String> {
     let ctx = spotify
         .current_playback(None, None::<Vec<_>>)
         .await
         .context("failed to fetch playback status")?;
 
-    match ctx {
+    let msg = match ctx {
         Some(c) if c.is_playing => {
             spotify
                 .pause_playback(None)
                 .await
                 .context("failed to pause")?;
-            println!("⏸ Paused");
+            "⏸ Paused".to_string()
         }
         Some(_) => {
             spotify
                 .resume_playback(None, None)
                 .await
                 .context("failed to resume playback")?;
-            println!("▶ Resumed playback");
+            "▶ Resumed playback".to_string()
         }
-        None => {
-            println!("No active device. Select one with `spoterm device use <name>`");
-        }
-    }
-    Ok(())
+        None => "No active device. Select one with `spoterm device use <name>`".to_string(),
+    };
+    Ok(msg)
 }
 
 pub async fn play(cfg: &Config, query: &[String]) -> Result<()> {
     let spotify = auth::authed_client(cfg).await?;
+    println!("{}", exec_play(&spotify, query).await?);
+    Ok(())
+}
 
+async fn exec_play(spotify: &AuthCodePkceSpotify, query: &[String]) -> Result<String> {
     // No arguments means resume.
     if query.is_empty() {
         spotify
             .resume_playback(None, None)
             .await
             .with_context(|| format!("failed to resume playback{NEED_DEVICE_HINT}"))?;
-        println!("▶ Resumed playback");
-        return Ok(());
+        return Ok("▶ Resumed playback".to_string());
     }
 
     // With a query, search for the top track and play it.
@@ -104,8 +127,7 @@ pub async fn play(cfg: &Config, query: &[String]) -> Result<()> {
     };
 
     let Some(track) = page.items.into_iter().next() else {
-        println!("No track found matching \"{q}\"");
-        return Ok(());
+        return Ok(format!("No track found matching \"{q}\""));
     };
 
     // The fields are independent, so they can be moved out individually.
@@ -120,6 +142,141 @@ pub async fn play(cfg: &Config, query: &[String]) -> Result<()> {
         .await
         .with_context(|| format!("failed to start playback{NEED_DEVICE_HINT}"))?;
 
-    println!("▶ Playing: {name} — {}", join_artists(&artists));
-    Ok(())
+    Ok(format!("▶ Playing: {name} — {}", join_artists(&artists)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_fixtures as fx;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Mount a single endpoint returning 204 (the empty success shape the control APIs use).
+    async fn mount_ok(server: &MockServer, http_method: &str, http_path: &str) {
+        Mock::given(method(http_method))
+            .and(path(http_path))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn exec_pause_sends_request_and_reports() {
+        let server = MockServer::start().await;
+        mount_ok(&server, "PUT", "/me/player/pause").await;
+        let client = crate::auth::test_client(&server.uri()).await;
+        assert_eq!(exec_pause(&client).await.unwrap(), "⏸ Paused");
+    }
+
+    #[tokio::test]
+    async fn exec_next_sends_request_and_reports() {
+        let server = MockServer::start().await;
+        mount_ok(&server, "POST", "/me/player/next").await;
+        let client = crate::auth::test_client(&server.uri()).await;
+        assert_eq!(exec_next(&client).await.unwrap(), "⏭ Next track");
+    }
+
+    #[tokio::test]
+    async fn exec_prev_sends_request_and_reports() {
+        let server = MockServer::start().await;
+        mount_ok(&server, "POST", "/me/player/previous").await;
+        let client = crate::auth::test_client(&server.uri()).await;
+        assert_eq!(exec_prev(&client).await.unwrap(), "⏮ Previous track");
+    }
+
+    #[tokio::test]
+    async fn exec_vol_sends_request_and_reports() {
+        let server = MockServer::start().await;
+        mount_ok(&server, "PUT", "/me/player/volume").await;
+        let client = crate::auth::test_client(&server.uri()).await;
+        assert_eq!(exec_vol(&client, 30).await.unwrap(), "🔊 Volume set to 30%");
+    }
+
+    #[tokio::test]
+    async fn exec_play_resumes_when_no_query() {
+        let server = MockServer::start().await;
+        mount_ok(&server, "PUT", "/me/player/play").await;
+        let client = crate::auth::test_client(&server.uri()).await;
+        assert_eq!(exec_play(&client, &[]).await.unwrap(), "▶ Resumed playback");
+    }
+
+    #[tokio::test]
+    async fn exec_play_searches_then_starts_playback() {
+        let server = MockServer::start().await;
+        let tracks = fx::page(
+            vec![fx::full_track(
+                "4iV5W9uYEdYUVa79Axb7Rh",
+                "Cool Song",
+                "The Artist",
+            )],
+            1,
+        );
+        Mock::given(method("GET"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "tracks": tracks })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/me/player/play"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = crate::auth::test_client(&server.uri()).await;
+        let out = exec_play(&client, &["cool".to_string()]).await.unwrap();
+        assert_eq!(out, "▶ Playing: Cool Song — The Artist");
+    }
+
+    #[tokio::test]
+    async fn exec_toggle_reports_no_active_device() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/me/player"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = crate::auth::test_client(&server.uri()).await;
+        let out = exec_toggle(&client).await.unwrap();
+        assert!(out.contains("No active device"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn exec_toggle_pauses_when_playing() {
+        let server = MockServer::start().await;
+        // The fixture reports is_playing: true, so toggle takes the pause branch.
+        Mock::given(method("GET"))
+            .and(path("/me/player"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(fx::playback_unknown_track("Song", "Artist")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/me/player/pause"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = crate::auth::test_client(&server.uri()).await;
+        assert_eq!(exec_toggle(&client).await.unwrap(), "⏸ Paused");
+    }
+
+    #[tokio::test]
+    async fn exec_play_reports_no_track_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "tracks": fx::empty_page() })),
+            )
+            .mount(&server)
+            .await;
+        let client = crate::auth::test_client(&server.uri()).await;
+        let out = exec_play(&client, &["nope".to_string()]).await.unwrap();
+        assert!(out.contains("No track found matching"), "{out}");
+    }
 }

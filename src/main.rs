@@ -4,6 +4,8 @@ mod commands;
 mod config;
 mod format;
 mod match_name;
+#[cfg(test)]
+mod test_fixtures;
 mod tui;
 
 use anyhow::Result;

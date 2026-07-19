@@ -1,6 +1,7 @@
 //! `spoterm devices`: list the available Spotify Connect devices.
 
 use anyhow::{Context, Result};
+use rspotify::AuthCodePkceSpotify;
 use rspotify::prelude::*;
 
 use crate::auth;
@@ -8,33 +9,35 @@ use crate::config::Config;
 
 pub async fn run(cfg: &Config) -> Result<()> {
     let spotify = auth::authed_client(cfg).await?;
+    println!("{}", execute(&spotify).await?);
+    Ok(())
+}
 
+/// Fetch the device list and build the listing. Returns the text to print so the API glue
+/// (request + response mapping) is testable.
+async fn execute(spotify: &AuthCodePkceSpotify) -> Result<String> {
     let devices = spotify
         .device()
         .await
         .context("failed to fetch the device list")?;
 
     if devices.is_empty() {
-        println!("No playable devices. Please open the Spotify app");
-        return Ok(());
+        return Ok("No playable devices. Please open the Spotify app".to_string());
     }
 
-    println!("Available devices:");
+    let mut lines = vec!["Available devices:".to_string()];
     for d in &devices {
         let type_label = format!("{:?}", d._type);
-        println!(
-            "{}",
-            render_device(
-                &d.name,
-                &type_label,
-                d.volume_percent,
-                d.is_active,
-                d.is_restricted
-            )
-        );
+        lines.push(render_device(
+            &d.name,
+            &type_label,
+            d.volume_percent,
+            d.is_active,
+            d.is_restricted,
+        ));
     }
 
-    Ok(())
+    Ok(lines.join("\n"))
 }
 
 /// Pure function that formats a single device line. Mapping `DeviceType` to a label is done on the caller side.
@@ -63,6 +66,41 @@ fn render_device(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_fixtures as fx;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn mount_devices(server: &MockServer, body: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path("/me/player/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn execute_reports_empty_device_list() {
+        let server = MockServer::start().await;
+        mount_devices(&server, fx::devices_envelope(vec![])).await;
+        let client = crate::auth::test_client(&server.uri()).await;
+        let out = execute(&client).await.unwrap();
+        assert!(out.contains("No playable devices"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn execute_lists_devices() {
+        let server = MockServer::start().await;
+        mount_devices(
+            &server,
+            fx::devices_envelope(vec![fx::device("d1", "My Mac", true)]),
+        )
+        .await;
+        let client = crate::auth::test_client(&server.uri()).await;
+        let out = execute(&client).await.unwrap();
+        assert!(out.contains("Available devices:"), "{out}");
+        assert!(out.contains("My Mac"), "{out}");
+        assert!(out.contains("(active)"), "{out}");
+    }
 
     #[test]
     fn render_device_active_with_volume() {
