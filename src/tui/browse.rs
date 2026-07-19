@@ -4,11 +4,11 @@
 
 use anyhow::{Context, Result};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use rspotify::AuthCodePkceSpotify;
 use rspotify::model::{AlbumId, PlayContextId, PlayableId, PlaylistId, TrackId};
 use rspotify::prelude::*;
 
 use crate::auth;
-use crate::config::Config;
 use crate::format::join_artists;
 
 /// プレイリストの取得件数（API 上限 50・先頭ページのみ）。
@@ -62,10 +62,48 @@ pub enum PlayTarget {
 }
 
 /// 一覧の 1 項目。
+#[derive(Clone)]
 pub struct BrowseItem {
     pub title: String,
     pub subtitle: String,
     pub target: PlayTarget,
+}
+
+/// タブごとの取得結果をセッション内でキャッシュする。タブ切替では再取得せず、
+/// `r`（リロード）でのみ破棄して取り直すことで、閲覧中の API 呼び出しを抑える。
+#[derive(Default)]
+pub struct BrowseCache {
+    playlists: Option<Vec<BrowseItem>>,
+    tracks: Option<Vec<BrowseItem>>,
+    albums: Option<Vec<BrowseItem>>,
+}
+
+impl BrowseCache {
+    fn slot(&mut self, tab: BrowseTab) -> &mut Option<Vec<BrowseItem>> {
+        match tab {
+            BrowseTab::Playlists => &mut self.playlists,
+            BrowseTab::Tracks => &mut self.tracks,
+            BrowseTab::Albums => &mut self.albums,
+        }
+    }
+
+    /// キャッシュ済みならその一覧を返す（空一覧も有効なキャッシュとして扱う）。
+    pub fn get(&self, tab: BrowseTab) -> Option<&Vec<BrowseItem>> {
+        match tab {
+            BrowseTab::Playlists => self.playlists.as_ref(),
+            BrowseTab::Tracks => self.tracks.as_ref(),
+            BrowseTab::Albums => self.albums.as_ref(),
+        }
+    }
+
+    pub fn set(&mut self, tab: BrowseTab, items: Vec<BrowseItem>) {
+        *self.slot(tab) = Some(items);
+    }
+
+    /// 指定タブのキャッシュを破棄する（リロード時に呼び、次回取得を強制する）。
+    pub fn clear(&mut self, tab: BrowseTab) {
+        *self.slot(tab) = None;
+    }
 }
 
 /// 閲覧オーバーレイの状態。
@@ -81,10 +119,12 @@ pub enum BrowseAction {
     None,
     /// オーバーレイを閉じる。
     Close,
-    /// タブを切り替える（再取得が必要）。
+    /// タブを切り替える（キャッシュがあれば再取得しない）。
     Switch(BrowseTab),
     /// 選択項目を再生する。
     Play,
+    /// 現在タブのキャッシュを捨てて取り直す。
+    Reload,
 }
 
 /// 選択位置を同期更新し、必要なアクションを返す。
@@ -104,13 +144,15 @@ pub fn key_action(key: KeyEvent, state: &mut BrowseState) -> BrowseAction {
             BrowseAction::None
         }
         KeyCode::Enter => BrowseAction::Play,
+        KeyCode::Char('r') => BrowseAction::Reload,
         _ => BrowseAction::None,
     }
 }
 
 /// 指定タブの一覧を取得する（既存コマンドと同じ API・先頭ページのみ）。
-pub async fn fetch(cfg: &Config, tab: BrowseTab) -> Result<Vec<BrowseItem>> {
-    let spotify = auth::authed_client(cfg).await?;
+/// クライアントは呼び出し側が保持し続けるものを借り、必要なときだけトークンを更新する。
+pub async fn fetch(spotify: &AuthCodePkceSpotify, tab: BrowseTab) -> Result<Vec<BrowseItem>> {
+    auth::ensure_fresh_token(spotify).await?;
     match tab {
         BrowseTab::Playlists => {
             let page = spotify
@@ -170,8 +212,8 @@ pub async fn fetch(cfg: &Config, tab: BrowseTab) -> Result<Vec<BrowseItem>> {
 }
 
 /// 選択項目を再生する。トラックは URI 単体、プレイリスト/アルバムはコンテキスト再生。
-pub async fn play(cfg: &Config, target: &PlayTarget) -> Result<()> {
-    let spotify = auth::authed_client(cfg).await?;
+pub async fn play(spotify: &AuthCodePkceSpotify, target: &PlayTarget) -> Result<()> {
+    auth::ensure_fresh_token(spotify).await?;
     let result = match target {
         PlayTarget::Track(uri) => {
             let id = TrackId::from_uri(uri).context("トラック URI の解析に失敗しました")?;

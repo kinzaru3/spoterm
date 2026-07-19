@@ -1,6 +1,8 @@
 //! 対話型 TUI（Phase 6）。Now Playing をライブ表示し、キー操作で再生を制御する。
 //!
-//! - 認証・トークン更新は既存の [`crate::auth::authed_client`] を再利用する。
+//! - 認証は起動時に一度だけ [`crate::auth::authed_client`] でクライアントを組み立て、以降は
+//!   それを保持して使い回す（reqwest の接続プールを捨てず、毎操作のディスク読みも避ける）。
+//!   トークンは [`crate::auth::ensure_fresh_token`] で期限切れ時のみ更新する。
 //! - `POLL_INTERVAL` ごとに `current_playback` を取得し、ポーリング間は
 //!   [`view::interpolate_progress`] で進捗をローカル補間して滑らかに見せる。
 //! - API エラーはステータス行に出してループは継続する（silent failure 禁止）。
@@ -110,6 +112,9 @@ enum SearchAction {
 
 /// TUI アプリの状態。
 struct App {
+    /// 起動時に組み立て、セッション中ずっと使い回す認証済みクライアント。
+    /// 毎操作で作り直すと接続プールを捨てて都度 TLS からやり直す（＝重い）ため保持する。
+    client: AuthCodePkceSpotify,
     /// 直近に取得した再生状況（無再生なら `None`）。
     now: Option<NowPlaying>,
     /// 直近の操作結果・エラーを表示するステータス行。
@@ -120,18 +125,21 @@ struct App {
     poll_failures: u32,
     /// 画面モード（通常 / 検索 / ライブラリ閲覧）。
     mode: Mode,
+    /// ライブラリ閲覧タブごとの取得結果キャッシュ（タブ切替での再取得を避ける）。
+    browse_cache: browse::BrowseCache,
 }
 
 /// `spoterm tui`: Now Playing ダッシュボードを起動する。
 pub async fn run(cfg: &Config) -> Result<()> {
     // 未ログインならここで分かりやすく失敗させ、端末を alt-screen にしない。
-    auth::authed_client(cfg)
+    // このクライアントをそのままループへ渡し、セッション中は使い回す。
+    let client = auth::authed_client(cfg)
         .await
         .context("TUI を起動できません")?;
 
     install_panic_hook();
     let mut terminal = setup_terminal().context("端末の初期化に失敗しました")?;
-    let result = run_loop(&mut terminal, cfg).await;
+    let result = run_loop(&mut terminal, client).await;
     // 描画結果に関わらず端末は必ず元に戻す。両方失敗したら両方を伝える。
     let restored = restore_terminal(&mut terminal);
     match (result, restored) {
@@ -142,13 +150,15 @@ pub async fn run(cfg: &Config) -> Result<()> {
 }
 
 /// メインループ。ポーリング → 描画 → 入力処理を繰り返す。
-async fn run_loop(terminal: &mut Term, cfg: &Config) -> Result<()> {
+async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify) -> Result<()> {
     let mut app = App {
+        client,
         now: None,
         status: "起動中…".to_string(),
         last_poll: None,
         poll_failures: 0,
         mode: Mode::Normal,
+        browse_cache: browse::BrowseCache::default(),
     };
 
     loop {
@@ -157,7 +167,7 @@ async fn run_loop(terminal: &mut Term, cfg: &Config) -> Result<()> {
         let forced = app.last_poll.is_none();
         let timer_due = app.last_poll.is_none_or(|t| t.elapsed() >= POLL_INTERVAL);
         if forced || (timer_due && app.poll_failures < MAX_POLL_FAILURES) {
-            poll_playback(cfg, &mut app).await;
+            poll_playback(&mut app).await;
             app.last_poll = Some(Instant::now());
         }
 
@@ -168,7 +178,7 @@ async fn run_loop(terminal: &mut Term, cfg: &Config) -> Result<()> {
         if event::poll(TICK)?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
-            && handle_key(key, cfg, &mut app).await
+            && handle_key(key, &mut app).await
         {
             break;
         }
@@ -177,33 +187,33 @@ async fn run_loop(terminal: &mut Term, cfg: &Config) -> Result<()> {
 }
 
 /// キー入力を処理する。終了要求なら `true` を返す。
-async fn handle_key(key: KeyEvent, cfg: &Config, app: &mut App) -> bool {
+async fn handle_key(key: KeyEvent, app: &mut App) -> bool {
     // Ctrl-C はどのモードでも終了。
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return true;
     }
     if matches!(app.mode, Mode::Search(_)) {
-        handle_search_key(key, cfg, app).await;
+        handle_search_key(key, app).await;
         false
     } else if matches!(app.mode, Mode::Browse(_)) {
-        handle_browse_key(key, cfg, app).await;
+        handle_browse_key(key, app).await;
         false
     } else {
-        handle_normal_key(key, cfg, app).await
+        handle_normal_key(key, app).await
     }
 }
 
 /// 通常（Now Playing）モードのキー処理。終了要求なら `true`。
-async fn handle_normal_key(key: KeyEvent, cfg: &Config, app: &mut App) -> bool {
+async fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => return true,
         KeyCode::Char('/') => app.mode = Mode::Search(SearchState::new()),
-        KeyCode::Char('2') => load_browse(cfg, app, browse::BrowseTab::Playlists).await,
-        KeyCode::Char(' ') => control_toggle(cfg, app).await,
-        KeyCode::Char('n') => control_next(cfg, app).await,
-        KeyCode::Char('p') => control_prev(cfg, app).await,
-        KeyCode::Char('+') | KeyCode::Char('=') => control_volume(cfg, app, VOL_STEP).await,
-        KeyCode::Char('-') | KeyCode::Char('_') => control_volume(cfg, app, -VOL_STEP).await,
+        KeyCode::Char('2') => load_browse(app, browse::BrowseTab::Playlists).await,
+        KeyCode::Char(' ') => control_toggle(app).await,
+        KeyCode::Char('n') => control_next(app).await,
+        KeyCode::Char('p') => control_prev(app).await,
+        KeyCode::Char('+') | KeyCode::Char('=') => control_volume(app, VOL_STEP).await,
+        KeyCode::Char('-') | KeyCode::Char('_') => control_volume(app, -VOL_STEP).await,
         // 手動更新: 失敗カウンタもリセットして自動更新を再開する。
         KeyCode::Char('r') => {
             app.poll_failures = 0;
@@ -215,7 +225,7 @@ async fn handle_normal_key(key: KeyEvent, cfg: &Config, app: &mut App) -> bool {
 }
 
 /// 検索オーバーレイのキー処理。同期でクエリ/選択を更新し、必要な非同期アクションを実行する。
-async fn handle_search_key(key: KeyEvent, cfg: &Config, app: &mut App) {
+async fn handle_search_key(key: KeyEvent, app: &mut App) {
     // まず借用を閉じてからアクションを実行する（非同期処理は app を再借用するため）。
     let action = {
         let Mode::Search(state) = &mut app.mode else {
@@ -226,8 +236,8 @@ async fn handle_search_key(key: KeyEvent, cfg: &Config, app: &mut App) {
     match action {
         SearchAction::None => {}
         SearchAction::Close => app.mode = Mode::Normal,
-        SearchAction::Submit(q) => run_search(cfg, app, &q).await,
-        SearchAction::Play(uri) => play_uri(cfg, app, uri).await,
+        SearchAction::Submit(q) => run_search(app, &q).await,
+        SearchAction::Play(uri) => play_uri(app, uri).await,
         SearchAction::BackToInput => {
             if let Mode::Search(state) = &mut app.mode {
                 // 入力に戻る＝クエリを組み直す想定。古い結果と選択は破棄する。
@@ -284,8 +294,8 @@ fn search_key_action(key: KeyEvent, state: &mut SearchState) -> SearchAction {
 }
 
 /// クエリでトラック検索し、結果フェーズへ遷移する。失敗時は入力フェーズに留めて案内する。
-async fn run_search(cfg: &Config, app: &mut App, q: &str) {
-    match search_tracks(cfg, q).await {
+async fn run_search(app: &mut App, q: &str) {
+    match search_tracks(app, q).await {
         Ok(hits) => {
             let message = hits
                 .is_empty()
@@ -308,9 +318,10 @@ async fn run_search(cfg: &Config, app: &mut App, q: &str) {
     }
 }
 
-async fn search_tracks(cfg: &Config, q: &str) -> Result<Vec<TrackHit>> {
-    let spotify = auth::authed_client(cfg).await?;
-    let result = spotify
+async fn search_tracks(app: &App, q: &str) -> Result<Vec<TrackHit>> {
+    auth::ensure_fresh_token(&app.client).await?;
+    let result = app
+        .client
         .search(q, SearchType::Track, None, None, Some(SEARCH_LIMIT), None)
         .await
         .context("検索に失敗しました")?;
@@ -333,8 +344,8 @@ fn track_to_hit(t: FullTrack) -> Option<TrackHit> {
 
 /// 選択トラックの URI を再生する。成功したら通常表示へ戻り、失敗はオーバーレイに残して
 /// メッセージで伝える（検索画面は `app.status` を描画しないため、ここでは `state.message` に出す）。
-async fn play_uri(cfg: &Config, app: &mut App, uri: String) {
-    match play_track(cfg, &uri).await {
+async fn play_uri(app: &mut App, uri: String) {
+    match play_track(app, &uri).await {
         Ok(()) => {
             app.status = "▶ 再生を開始しました".to_string();
             app.last_poll = None; // 再生開始を素早く画面へ反映
@@ -350,10 +361,10 @@ async fn play_uri(cfg: &Config, app: &mut App, uri: String) {
     }
 }
 
-async fn play_track(cfg: &Config, uri: &str) -> Result<()> {
+async fn play_track(app: &App, uri: &str) -> Result<()> {
     let id = TrackId::from_uri(uri).context("トラック URI の解析に失敗しました")?;
-    let spotify = auth::authed_client(cfg).await?;
-    spotify
+    auth::ensure_fresh_token(&app.client).await?;
+    app.client
         .start_uris_playback([PlayableId::Track(id)], None, None, None)
         .await
         .context("再生の開始に失敗しました（アクティブなデバイスが必要かもしれません）")?;
@@ -363,8 +374,8 @@ async fn play_track(cfg: &Config, uri: &str) -> Result<()> {
 // ---- API 連携 ---------------------------------------------------------------
 
 /// 再生状況を取得して `app.now` を更新する。失敗はステータス行に出す。
-async fn poll_playback(cfg: &Config, app: &mut App) {
-    match fetch_playback(cfg).await {
+async fn poll_playback(app: &mut App) {
+    match fetch_playback(app).await {
         Ok(Some(np)) => {
             app.now = Some(np);
             app.poll_failures = 0;
@@ -384,9 +395,10 @@ async fn poll_playback(cfg: &Config, app: &mut App) {
     }
 }
 
-async fn fetch_playback(cfg: &Config) -> Result<Option<NowPlaying>> {
-    let spotify = auth::authed_client(cfg).await?;
-    let ctx = spotify
+async fn fetch_playback(app: &App) -> Result<Option<NowPlaying>> {
+    auth::ensure_fresh_token(&app.client).await?;
+    let ctx = app
+        .client
         .current_playback(None, None::<Vec<_>>)
         .await
         .context("再生状況の取得に失敗しました")?;
@@ -432,13 +444,13 @@ fn snapshot_from_context(ctx: CurrentPlaybackContext) -> NowPlaying {
     }
 }
 
-/// 認証済みクライアントを取得する。失敗時はステータス行に出して `None` を返す。
-async fn acquire_client(cfg: &Config, app: &mut App) -> Option<AuthCodePkceSpotify> {
-    match auth::authed_client(cfg).await {
-        Ok(c) => Some(c),
+/// 保持中クライアントのトークンを必要なら更新する。失敗時はステータス行に出して `false` を返す。
+async fn ensure_ready(app: &mut App) -> bool {
+    match auth::ensure_fresh_token(&app.client).await {
+        Ok(()) => true,
         Err(e) => {
             app.status = format!("⚠ {e}");
-            None
+            false
         }
     }
 }
@@ -456,48 +468,54 @@ fn finish<E: std::fmt::Display>(app: &mut App, res: Result<(), E>, ok: &str) {
     }
 }
 
-async fn control_toggle(cfg: &Config, app: &mut App) {
+async fn control_toggle(app: &mut App) {
     let playing = app.now.as_ref().is_some_and(|n| n.is_playing);
-    let Some(c) = acquire_client(cfg, app).await else {
+    if !ensure_ready(app).await {
         return;
-    };
+    }
+    // 借用衝突を避けるため結果を先に確定してから finish（&mut app）へ渡す。
     if playing {
-        finish(app, c.pause_playback(None).await, "⏸ 一時停止");
+        let res = app.client.pause_playback(None).await;
+        finish(app, res, "⏸ 一時停止");
     } else {
-        finish(app, c.resume_playback(None, None).await, "▶ 再生");
+        let res = app.client.resume_playback(None, None).await;
+        finish(app, res, "▶ 再生");
     }
 }
 
-async fn control_next(cfg: &Config, app: &mut App) {
-    let Some(c) = acquire_client(cfg, app).await else {
+async fn control_next(app: &mut App) {
+    if !ensure_ready(app).await {
         return;
-    };
-    finish(app, c.next_track(None).await, "⏭ 次の曲へ");
+    }
+    let res = app.client.next_track(None).await;
+    finish(app, res, "⏭ 次の曲へ");
 }
 
-async fn control_prev(cfg: &Config, app: &mut App) {
-    let Some(c) = acquire_client(cfg, app).await else {
+async fn control_prev(app: &mut App) {
+    if !ensure_ready(app).await {
         return;
-    };
-    finish(app, c.previous_track(None).await, "⏮ 前の曲へ");
+    }
+    let res = app.client.previous_track(None).await;
+    finish(app, res, "⏮ 前の曲へ");
 }
 
-async fn control_volume(cfg: &Config, app: &mut App, delta: i16) {
+async fn control_volume(app: &mut App, delta: i16) {
     let Some(cur) = app.now.as_ref().and_then(|n| n.volume) else {
         app.status = "⚠ デバイス音量が取得できません".to_string();
         return;
     };
     let next = (cur as i16 + delta).clamp(0, 100) as u8;
-    let Some(c) = acquire_client(cfg, app).await else {
+    if !ensure_ready(app).await {
         return;
-    };
-    finish(app, c.volume(next, None).await, &format!("🔊 音量 {next}%"));
+    }
+    let res = app.client.volume(next, None).await;
+    finish(app, res, &format!("🔊 音量 {next}%"));
 }
 
 // ---- ライブラリ閲覧（browse） -----------------------------------------------
 
 /// 閲覧オーバーレイのキー処理。同期で選択を更新し、必要な非同期アクションを実行する。
-async fn handle_browse_key(key: KeyEvent, cfg: &Config, app: &mut App) {
+async fn handle_browse_key(key: KeyEvent, app: &mut App) {
     let action = {
         let Mode::Browse(state) = &mut app.mode else {
             return;
@@ -507,38 +525,57 @@ async fn handle_browse_key(key: KeyEvent, cfg: &Config, app: &mut App) {
     match action {
         browse::BrowseAction::None => {}
         browse::BrowseAction::Close => app.mode = Mode::Normal,
-        browse::BrowseAction::Switch(tab) => load_browse(cfg, app, tab).await,
-        browse::BrowseAction::Play => browse_play(cfg, app).await,
+        browse::BrowseAction::Switch(tab) => load_browse(app, tab).await,
+        browse::BrowseAction::Play => browse_play(app).await,
+        browse::BrowseAction::Reload => {
+            // 現在タブのキャッシュを捨てて取り直す（＝ユーザー主導のリロード）。
+            let Mode::Browse(state) = &app.mode else {
+                return;
+            };
+            let tab = state.tab;
+            app.browse_cache.clear(tab);
+            load_browse(app, tab).await;
+        }
     }
 }
 
-/// 指定タブの一覧を取得して閲覧モードに入る（既に閲覧中ならタブ切替）。失敗は案内する。
-async fn load_browse(cfg: &Config, app: &mut App, tab: browse::BrowseTab) {
-    match browse::fetch(cfg, tab).await {
-        Ok(items) => {
-            let message = items
-                .is_empty()
-                .then(|| format!("{} は空です", tab.label()));
-            app.mode = Mode::Browse(browse::BrowseState {
-                tab,
-                items,
-                selected: 0,
-                message,
-            });
-        }
-        Err(e) => {
-            // 閲覧中なら画面に留めてメッセージ表示、通常表示中ならステータス行へ。
-            if let Mode::Browse(state) = &mut app.mode {
-                state.message = Some(format!("取得に失敗しました: {e}"));
-            } else {
-                app.status = format!("⚠ ライブラリの取得に失敗: {e}");
+/// 指定タブの一覧を表示して閲覧モードに入る（既に閲覧中ならタブ切替）。
+/// キャッシュがあればネットワークへ行かず、無いときだけ取得してキャッシュする。失敗は案内する。
+async fn load_browse(app: &mut App, tab: browse::BrowseTab) {
+    // キャッシュ済みなら複製して即表示（clone は数十件の小さな構造体で安価）。
+    let items = match app.browse_cache.get(tab).cloned() {
+        Some(items) => items,
+        None => {
+            match browse::fetch(&app.client, tab).await {
+                Ok(items) => {
+                    app.browse_cache.set(tab, items.clone());
+                    items
+                }
+                Err(e) => {
+                    // 閲覧中なら画面に留めてメッセージ表示、通常表示中ならステータス行へ。
+                    if let Mode::Browse(state) = &mut app.mode {
+                        state.message = Some(format!("取得に失敗しました: {e}"));
+                    } else {
+                        app.status = format!("⚠ ライブラリの取得に失敗: {e}");
+                    }
+                    return;
+                }
             }
         }
-    }
+    };
+    let message = items
+        .is_empty()
+        .then(|| format!("{} は空です", tab.label()));
+    app.mode = Mode::Browse(browse::BrowseState {
+        tab,
+        items,
+        selected: 0,
+        message,
+    });
 }
 
 /// 選択項目を再生する。成功で通常表示へ戻り、失敗はオーバーレイにメッセージを残す。
-async fn browse_play(cfg: &Config, app: &mut App) {
+async fn browse_play(app: &mut App) {
     let target = match &app.mode {
         Mode::Browse(state) => state.items.get(state.selected).map(|it| it.target.clone()),
         _ => None,
@@ -546,7 +583,7 @@ async fn browse_play(cfg: &Config, app: &mut App) {
     let Some(target) = target else {
         return;
     };
-    match browse::play(cfg, &target).await {
+    match browse::play(&app.client, &target).await {
         Ok(()) => {
             app.status = "▶ 再生を開始しました".to_string();
             app.last_poll = None;
@@ -702,7 +739,7 @@ fn draw_browse(frame: &mut ratatui::Frame, state: &browse::BrowseState) {
 
     let hint = state.message.clone().unwrap_or_else(|| {
         format!(
-            "{} 件 — ↑↓ 選択 / ←→ タブ / Enter 再生 / Esc 戻る",
+            "{} 件 — ↑↓ 選択 / ←→ タブ / Enter 再生 / r 更新 / Esc 戻る",
             state.items.len()
         )
     });
@@ -725,7 +762,7 @@ fn draw_browse(frame: &mut ratatui::Frame, state: &browse::BrowseState) {
     frame.render_stateful_widget(list, rows[2], &mut list_state);
 
     frame.render_widget(
-        Paragraph::new("↑↓ 選択   ←→ タブ   Enter 再生   Esc 戻る   Ctrl-C 終了")
+        Paragraph::new("↑↓ 選択   ←→ タブ   Enter 再生   r 更新   Esc 戻る   Ctrl-C 終了")
             .alignment(Alignment::Center)
             .style(dim),
         rows[3],
