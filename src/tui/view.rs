@@ -16,6 +16,9 @@ pub struct NowPlaying {
     pub duration_ms: u128,
     pub device: String,
     pub volume: Option<u8>,
+    /// 現在曲のトラック URI（`spotify:track:…`）。保存操作・曲変化検知に使う。
+    /// エピソードや曲情報不明のときは `None`。
+    pub track_uri: Option<String>,
     /// このスナップショットを取得した時刻（進捗補間の基点）。
     pub fetched_at: Instant,
 }
@@ -59,9 +62,24 @@ pub struct RenderLines {
     pub device: String,
 }
 
+/// 現在曲の保存状態を表す短いマーカー（state 行末尾に付す）。`None` は状態不明で無表示。
+fn saved_marker(saved: Option<bool>) -> &'static str {
+    match saved {
+        Some(true) => "   ♥ 保存済み",
+        Some(false) => "   ♡ 未保存",
+        None => "",
+    }
+}
+
 /// Now Playing の表示行を組み立てる。`elapsed_ms` は前回取得からの経過（進捗補間の基点）、
-/// `width` は各行の折り返し幅。無再生（`None`）時は案内文を返す。
-pub fn render_lines(now: Option<&NowPlaying>, elapsed_ms: u128, width: usize) -> RenderLines {
+/// `width` は各行の折り返し幅、`saved` は現在曲のライブラリ保存状態（`None` は不明）。
+/// 無再生（`None`）時は案内文を返す。
+pub fn render_lines(
+    now: Option<&NowPlaying>,
+    elapsed_ms: u128,
+    width: usize,
+    saved: Option<bool>,
+) -> RenderLines {
     let line = |label: &str, value: &str| -> String {
         format!(
             "{label}{}",
@@ -93,7 +111,7 @@ pub fn render_lines(now: Option<&NowPlaying>, elapsed_ms: u128, width: usize) ->
         .unwrap_or_else(|| "-".to_string());
 
     RenderLines {
-        state: head.to_string(),
+        state: format!("{head}{}", saved_marker(saved)),
         title: line("♪ ", &n.title),
         artist: line("  ", &n.artists),
         album: n
@@ -104,6 +122,21 @@ pub fn render_lines(now: Option<&NowPlaying>, elapsed_ms: u128, width: usize) ->
         ratio: progress_ratio(prog, n.duration_ms),
         progress_label: format!("{} / {}", format_ms(prog), format_ms(n.duration_ms)),
         device: format!("🔈 {} (vol {vol})", n.device),
+    }
+}
+
+/// シーク後の目標位置（ms）を返す純粋関数。`current_ms` に `delta_ms`（負で後退）を足し、
+/// `[0, duration_ms]` にクランプする。`duration_ms == 0`（尺不明）のときは上限を設けない。
+pub fn seek_target(current_ms: u128, duration_ms: u128, delta_ms: i64) -> u128 {
+    let target = if delta_ms >= 0 {
+        current_ms.saturating_add(delta_ms as u128)
+    } else {
+        current_ms.saturating_sub(delta_ms.unsigned_abs() as u128)
+    };
+    if duration_ms == 0 {
+        target
+    } else {
+        target.min(duration_ms)
     }
 }
 
@@ -197,6 +230,7 @@ mod tests {
             duration_ms: 180_000,
             device: "spotifyd".to_string(),
             volume: Some(40),
+            track_uri: Some("spotify:track:xxxx".to_string()),
             fetched_at: std::time::Instant::now(),
         }
     }
@@ -204,7 +238,7 @@ mod tests {
     #[test]
     fn render_lines_shows_track_and_progress() {
         let n = sample(true);
-        let out = render_lines(Some(&n), 0, 80);
+        let out = render_lines(Some(&n), 0, 80, None);
         assert_eq!(out.state, "▶ 再生中");
         assert!(out.title.contains("Song"));
         assert!(out.artist.contains("Artist"));
@@ -216,10 +250,46 @@ mod tests {
 
     #[test]
     fn render_lines_empty_state_when_nothing_playing() {
-        let out = render_lines(None, 0, 80);
+        let out = render_lines(None, 0, 80, None);
         assert_eq!(out.state, "再生中の曲はありません");
         assert!(out.artist.is_empty());
         assert_eq!(out.ratio, 0.0);
+    }
+
+    #[test]
+    fn render_lines_shows_saved_marker() {
+        let n = sample(true);
+        // 保存済みは ♥、未保存は ♡、不明は無表示
+        assert!(
+            render_lines(Some(&n), 0, 80, Some(true))
+                .state
+                .contains("♥")
+        );
+        assert!(
+            render_lines(Some(&n), 0, 80, Some(false))
+                .state
+                .contains("♡")
+        );
+        let unknown = render_lines(Some(&n), 0, 80, None).state;
+        assert!(!unknown.contains('♥') && !unknown.contains('♡'));
+    }
+
+    #[test]
+    fn seek_target_advances_and_rewinds() {
+        // 前進
+        assert_eq!(seek_target(60_000, 180_000, 5_000), 65_000);
+        // 後退
+        assert_eq!(seek_target(60_000, 180_000, -5_000), 55_000);
+    }
+
+    #[test]
+    fn seek_target_clamps_bounds() {
+        // 下限 0（後退しすぎ）
+        assert_eq!(seek_target(3_000, 180_000, -5_000), 0);
+        // 上限 duration（前進しすぎ）
+        assert_eq!(seek_target(178_000, 180_000, 5_000), 180_000);
+        // 尺不明（0）は上限なし
+        assert_eq!(seek_target(178_000, 0, 5_000), 183_000);
     }
 
     #[test]

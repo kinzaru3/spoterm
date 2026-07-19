@@ -29,7 +29,9 @@ pub fn build_client(cfg: &Config) -> Result<AuthCodePkceSpotify> {
             "user-modify-playback-state",
             "playlist-read-private",
             "playlist-read-collaborative",
-            "user-library-read"
+            "user-library-read",
+            // 現在曲の保存/解除（TUI の `s`）に必要。追加後は再ログインで新スコープを付与する。
+            "user-library-modify"
         ),
         ..Default::default()
     };

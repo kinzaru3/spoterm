@@ -104,6 +104,16 @@ pub(crate) fn track_from_json(v: &Value) -> (String, Vec<String>, Option<String>
     (title, artists, album, duration_ms)
 }
 
+/// `/me/player` のトラック JSON（Unknown に落ちたもの）から、ライブラリ操作に使う
+/// トラック URI（`spotify:track:…`）を取り出す。トラック以外（エピソード等）や URI 欠落は `None`。
+/// TUI の保存機能（`s`）が Unknown 経路でも動くよう crate 内公開にしている。
+pub(crate) fn track_id_from_json(v: &Value) -> Option<String> {
+    v.get("uri")
+        .and_then(Value::as_str)
+        .filter(|uri| uri.starts_with("spotify:track:"))
+        .map(str::to_string)
+}
+
 /// 再生状況の表示ブロックを組み立てる純粋関数。API 応答からの写像は呼び出し側で行う。
 // 表示に必要な素をプリミティブで受け取りテスト容易性を優先している。呼び出し元は 1 箇所のみで
 // 専用の表示用構造体を挟むほどの重複はないため、引数の多さは許容する（YAGNI）。
@@ -197,5 +207,23 @@ mod tests {
         assert!(artists.is_empty());
         assert_eq!(album, None);
         assert_eq!(dur, 0);
+    }
+
+    #[test]
+    fn track_id_from_json_extracts_track_uri() {
+        let v = serde_json::json!({ "uri": "spotify:track:4iV5W9uYEdYUVa79Axb7Rh" });
+        assert_eq!(
+            track_id_from_json(&v).as_deref(),
+            Some("spotify:track:4iV5W9uYEdYUVa79Axb7Rh")
+        );
+    }
+
+    #[test]
+    fn track_id_from_json_ignores_non_track_and_missing() {
+        // エピソード URI はトラックとして扱わない
+        let ep = serde_json::json!({ "uri": "spotify:episode:512ojhOuo1ktJprKbVcKyQ" });
+        assert_eq!(track_id_from_json(&ep), None);
+        // uri 欠落
+        assert_eq!(track_id_from_json(&serde_json::json!({})), None);
     }
 }

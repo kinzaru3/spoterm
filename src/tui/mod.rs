@@ -27,7 +27,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph};
 use rspotify::AuthCodePkceSpotify;
 use rspotify::model::{
-    CurrentPlaybackContext, FullTrack, PlayableId, PlayableItem, SearchResult, SearchType, TrackId,
+    CurrentPlaybackContext, FullTrack, LibraryId, PlayableId, PlayableItem, SearchResult,
+    SearchType, TrackId,
 };
 use rspotify::prelude::*;
 
@@ -42,6 +43,8 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_millis(200);
 /// 音量ステップ（+/-）。
 const VOL_STEP: i16 = 5;
+/// シークステップ（←/→、ミリ秒）。
+const SEEK_STEP_MS: i64 = 5_000;
 /// 連続ポーリング失敗がこの回数に達したら自動更新を止める（無効トークン等での無限リトライ回避）。
 const MAX_POLL_FAILURES: u32 = 3;
 /// 検索時に取得する上限件数。
@@ -125,10 +128,15 @@ struct App {
     last_poll: Option<Instant>,
     /// 連続ポーリング失敗回数。閾値を超えたら自動更新を止め、手動再試行を促す。
     poll_failures: u32,
-    /// 画面モード（通常 / 検索 / ライブラリ閲覧）。
+    /// 画面モード（通常 / 検索 / ライブラリ閲覧 / デバイス選択）。
     mode: Mode,
     /// ライブラリ閲覧タブごとの取得結果キャッシュ（タブ切替での再取得を避ける）。
     browse_cache: browse::BrowseCache,
+    /// 現在曲がライブラリに保存済みか（`None` は未確定）。曲変化時のみ再取得する。
+    saved: Option<bool>,
+    /// 現在曲の保存状態を問い合わせ済みか。曲ごとに 1 回だけ問い合わせ、永続失敗での
+    /// 毎ポーリング連打を防ぐ（曲が変わると `false` に戻す）。
+    saved_checked: bool,
 }
 
 /// `spoterm tui`: Now Playing ダッシュボードを起動する。
@@ -161,6 +169,8 @@ async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify) -> Result<()
         poll_failures: 0,
         mode: Mode::Normal,
         browse_cache: browse::BrowseCache::default(),
+        saved: None,
+        saved_checked: false,
     };
 
     loop {
@@ -220,6 +230,9 @@ async fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
         KeyCode::Char('p') => control_prev(app).await,
         KeyCode::Char('+') | KeyCode::Char('=') => control_volume(app, VOL_STEP).await,
         KeyCode::Char('-') | KeyCode::Char('_') => control_volume(app, -VOL_STEP).await,
+        KeyCode::Left => control_seek(app, -SEEK_STEP_MS).await,
+        KeyCode::Right => control_seek(app, SEEK_STEP_MS).await,
+        KeyCode::Char('s') => control_save(app).await,
         // 手動更新: 失敗カウンタもリセットして自動更新を再開する。
         KeyCode::Char('r') => {
             app.poll_failures = 0;
@@ -383,11 +396,20 @@ async fn play_track(app: &App, uri: &str) -> Result<()> {
 async fn poll_playback(app: &mut App) {
     match fetch_playback(app).await {
         Ok(Some(np)) => {
+            // 曲が変わったら保存状態を破棄し、次で取り直す（毎ポーリングではなく変化時のみ）。
+            let prev_uri = app.now.as_ref().and_then(|n| n.track_uri.clone());
+            if np.track_uri != prev_uri {
+                app.saved = None;
+                app.saved_checked = false;
+            }
             app.now = Some(np);
             app.poll_failures = 0;
+            refresh_saved(app).await;
         }
         Ok(None) => {
             app.now = None;
+            app.saved = None;
+            app.saved_checked = false;
             app.poll_failures = 0;
         }
         Err(e) => {
@@ -422,19 +444,42 @@ fn snapshot_from_context(ctx: CurrentPlaybackContext) -> NowPlaying {
         .unwrap_or(0);
     let is_playing = ctx.is_playing;
 
-    let (title, artists, album, duration_ms) = match ctx.item {
+    // track_uri は保存操作・曲変化検知に使う。Track は型付き ID、Unknown は生 JSON から取り出す。
+    let (title, artists, album, duration_ms, track_uri) = match ctx.item {
         Some(PlayableItem::Track(t)) => {
             let artists: Vec<String> = t.artists.into_iter().map(|a| a.name).collect();
             let dur = t.duration.num_milliseconds().max(0) as u128;
-            (t.name, artists, Some(t.album.name), dur)
+            let uri = t.id.as_ref().map(|id| id.uri());
+            (t.name, artists, Some(t.album.name), dur, uri)
         }
         Some(PlayableItem::Episode(e)) => {
             let dur = e.duration.num_milliseconds().max(0) as u128;
-            (e.name, vec!["(ポッドキャスト)".to_string()], None, dur)
+            (
+                e.name,
+                vec!["(ポッドキャスト)".to_string()],
+                None,
+                dur,
+                None,
+            )
         }
         // status コマンドと同じく、Unknown に落ちた生 JSON からフォールバック抽出する。
-        Some(PlayableItem::Unknown(v)) => crate::commands::status::track_from_json(&v),
-        None => ("(再生中の曲情報なし)".to_string(), Vec::new(), None, 0),
+        Some(PlayableItem::Unknown(v)) => {
+            let (title, artists, album, dur) = crate::commands::status::track_from_json(&v);
+            (
+                title,
+                artists,
+                album,
+                dur,
+                crate::commands::status::track_id_from_json(&v),
+            )
+        }
+        None => (
+            "(再生中の曲情報なし)".to_string(),
+            Vec::new(),
+            None,
+            0,
+            None,
+        ),
     };
 
     NowPlaying {
@@ -446,6 +491,7 @@ fn snapshot_from_context(ctx: CurrentPlaybackContext) -> NowPlaying {
         duration_ms,
         device,
         volume,
+        track_uri,
         fetched_at: Instant::now(),
     }
 }
@@ -516,6 +562,106 @@ async fn control_volume(app: &mut App, delta: i16) {
     }
     let res = app.client.volume(next, None).await;
     finish(app, res, &format!("🔊 音量 {next}%"));
+}
+
+/// 現在曲の保存状態を取得して `app.saved` を更新する。best-effort：`saved` 未確定かつ URI が
+/// あるときだけ問い合わせ、失敗しても状態を出さない（本流のポーリングがネットワーク/トークン
+/// エラーを報告するため、ここで status を上書きして混乱させない）。マーカーが出ないだけ。
+async fn refresh_saved(app: &mut App) {
+    // 曲ごとに 1 回だけ問い合わせる（`saved_checked`）。永続失敗でも毎ポーリング連打しない。
+    if app.saved_checked {
+        return;
+    }
+    let Some(uri) = app.now.as_ref().and_then(|n| n.track_uri.clone()) else {
+        return; // トラック不明（エピソード等）は問い合わせない。API も呼ばない。
+    };
+    let Ok(id) = TrackId::from_uri(&uri) else {
+        app.saved_checked = true;
+        return;
+    };
+    // トークン更新失敗は打ち止めにしない（本流ポーリングが失敗を報告し、閾値超で自動更新自体が止まる）。
+    if auth::ensure_fresh_token(&app.client).await.is_err() {
+        return;
+    }
+    // 成否に関わらずこの曲での再問い合わせは打ち止め（best-effort）。
+    app.saved_checked = true;
+    if let Ok(mut flags) = app.client.library_contains([LibraryId::Track(id)]).await {
+        app.saved = flags.pop();
+    }
+}
+
+/// 現在曲を ±`delta_ms` シークする。目標はローカル進捗（補間込み）から算出し、成功したら
+/// 進捗を即時更新して画面へ反映する（Connect の伝播遅延で巻き戻って見えるのを避けるため
+/// 強制ポーリングはしない）。連打は都度更新するローカル進捗から積算される。
+async fn control_seek(app: &mut App, delta_ms: i64) {
+    let Some(n) = app.now.as_ref() else {
+        app.status = "⚠ 再生中の曲がありません".to_string();
+        return;
+    };
+    let elapsed = n.fetched_at.elapsed().as_millis();
+    let current = view::interpolate_progress(n.progress_ms, elapsed, n.duration_ms, n.is_playing);
+    let target = view::seek_target(current, n.duration_ms, delta_ms);
+    if !ensure_ready(app).await {
+        return;
+    }
+    // target as i64: target は duration_ms でクランプ済み（尺不明時も現実的な連打回数の範囲）で
+    // i64::MAX（≒2.9 億年）に達しないため安全。
+    let res = app
+        .client
+        .seek_track(chrono::Duration::milliseconds(target as i64), None)
+        .await;
+    match res {
+        Ok(()) => {
+            // ローカル進捗を即時反映（強制ポーリングはしない）。
+            if let Some(n) = app.now.as_mut() {
+                n.progress_ms = target;
+                n.fetched_at = Instant::now();
+            }
+            app.status = format!("⏩ シーク {}", crate::format::format_ms(target));
+        }
+        Err(e) => {
+            app.status = format!("⚠ シークに失敗: {e}（d でデバイスを選択して有効化してください）");
+        }
+    }
+}
+
+/// 現在曲をライブラリに保存/解除する（`s`）。現在の保存状態の反対にし、成功で状態を更新する。
+async fn control_save(app: &mut App) {
+    let Some(uri) = app.now.as_ref().and_then(|n| n.track_uri.clone()) else {
+        app.status = "⚠ 現在の曲を保存できません（トラック情報が不明です）".to_string();
+        return;
+    };
+    let id = match TrackId::from_uri(&uri) {
+        Ok(id) => id,
+        Err(e) => {
+            app.status = format!("⚠ トラック URI の解析に失敗: {e}");
+            return;
+        }
+    };
+    if !ensure_ready(app).await {
+        return;
+    }
+    // 未確定なら「保存する」と解釈する。
+    let want_save = !app.saved.unwrap_or(false);
+    let res = if want_save {
+        app.client.library_add([LibraryId::Track(id)]).await
+    } else {
+        app.client.library_remove([LibraryId::Track(id)]).await
+    };
+    match res {
+        Ok(()) => {
+            app.saved = Some(want_save);
+            app.saved_checked = true;
+            app.status = if want_save {
+                "♥ ライブラリに保存しました".to_string()
+            } else {
+                "♡ 保存を解除しました".to_string()
+            };
+        }
+        Err(e) => {
+            app.status = format!("⚠ 保存操作に失敗: {e}");
+        }
+    }
 }
 
 // ---- ライブラリ閲覧（browse） -----------------------------------------------
@@ -768,7 +914,7 @@ fn draw_now(frame: &mut ratatui::Frame, app: &App) {
         .as_ref()
         .map(|n| n.fetched_at.elapsed().as_millis())
         .unwrap_or(0);
-    let v = view::render_lines(app.now.as_ref(), elapsed, inner.width as usize);
+    let v = view::render_lines(app.now.as_ref(), elapsed, inner.width as usize, app.saved);
 
     let bold = Style::default().add_modifier(Modifier::BOLD);
     frame.render_widget(Paragraph::new(v.state).style(bold), rows[0]);
@@ -786,7 +932,7 @@ fn draw_now(frame: &mut ratatui::Frame, app: &App) {
     frame.render_widget(Paragraph::new(app.status.clone()), rows[7]);
     frame.render_widget(
         Paragraph::new(
-            "space ⏯   n ⏭   p ⏮   +/- 音量   / 検索   2 ライブラリ   d デバイス   r 更新   q 終了",
+            "space ⏯  n ⏭  p ⏮  ←→ シーク  +/- 音量  s ♥  / 検索  2 ライブラリ  d デバイス  r 更新  q 終了",
         )
         .alignment(Alignment::Center)
         .style(Style::default().add_modifier(Modifier::DIM)),
