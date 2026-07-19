@@ -20,9 +20,11 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
-use ratatui::widgets::{Block, Borders, Gauge, Paragraph};
+use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph};
 use rspotify::AuthCodePkceSpotify;
-use rspotify::model::{CurrentPlaybackContext, PlayableItem};
+use rspotify::model::{
+    CurrentPlaybackContext, FullTrack, PlayableId, PlayableItem, SearchResult, SearchType, TrackId,
+};
 use rspotify::prelude::*;
 
 use crate::auth;
@@ -38,8 +40,71 @@ const TICK: Duration = Duration::from_millis(200);
 const VOL_STEP: i16 = 5;
 /// 連続ポーリング失敗がこの回数に達したら自動更新を止める（無効トークン等での無限リトライ回避）。
 const MAX_POLL_FAILURES: u32 = 3;
+/// 検索時に取得する上限件数。
+const SEARCH_LIMIT: u32 = 10;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
+
+/// 画面モード。通常は Now Playing、`/` で検索オーバーレイに入る。
+enum Mode {
+    Normal,
+    Search(SearchState),
+}
+
+/// 検索オーバーレイの状態。
+struct SearchState {
+    /// 入力中のクエリ。
+    query: String,
+    /// 入力中か結果選択中か。
+    phase: SearchPhase,
+    /// 検索結果（再生可能なトラックのみ）。
+    results: Vec<TrackHit>,
+    /// 結果リストの選択位置。
+    selected: usize,
+    /// 補足メッセージ（0 件・エラーなど）。
+    message: Option<String>,
+}
+
+impl SearchState {
+    fn new() -> Self {
+        Self {
+            query: String::new(),
+            phase: SearchPhase::Input,
+            results: Vec::new(),
+            selected: 0,
+            message: None,
+        }
+    }
+}
+
+/// 検索オーバーレイのフェーズ。
+#[derive(Clone, Copy, PartialEq)]
+enum SearchPhase {
+    /// クエリ入力中。
+    Input,
+    /// 結果を選択中。
+    Results,
+}
+
+/// 検索結果の 1 トラック（再生に使う URI を保持）。
+struct TrackHit {
+    name: String,
+    artists: String,
+    uri: String,
+}
+
+/// 検索キー処理が本体に依頼する非同期アクション。
+enum SearchAction {
+    None,
+    /// オーバーレイを閉じて通常表示へ戻る。
+    Close,
+    /// クエリで検索を実行する。
+    Submit(String),
+    /// 選択トラック（URI）を再生する。
+    Play(String),
+    /// 結果選択から入力へ戻る（クエリ修正）。
+    BackToInput,
+}
 
 /// TUI アプリの状態。
 struct App {
@@ -51,6 +116,8 @@ struct App {
     last_poll: Option<Instant>,
     /// 連続ポーリング失敗回数。閾値を超えたら自動更新を止め、手動再試行を促す。
     poll_failures: u32,
+    /// 画面モード（通常 / 検索オーバーレイ）。
+    mode: Mode,
 }
 
 /// `spoterm tui`: Now Playing ダッシュボードを起動する。
@@ -79,6 +146,7 @@ async fn run_loop(terminal: &mut Term, cfg: &Config) -> Result<()> {
         status: "起動中…".to_string(),
         last_poll: None,
         poll_failures: 0,
+        mode: Mode::Normal,
     };
 
     loop {
@@ -108,9 +176,23 @@ async fn run_loop(terminal: &mut Term, cfg: &Config) -> Result<()> {
 
 /// キー入力を処理する。終了要求なら `true` を返す。
 async fn handle_key(key: KeyEvent, cfg: &Config, app: &mut App) -> bool {
+    // Ctrl-C はどのモードでも終了。
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return true;
+    }
+    if matches!(app.mode, Mode::Search(_)) {
+        handle_search_key(key, cfg, app).await;
+        false
+    } else {
+        handle_normal_key(key, cfg, app).await
+    }
+}
+
+/// 通常（Now Playing）モードのキー処理。終了要求なら `true`。
+async fn handle_normal_key(key: KeyEvent, cfg: &Config, app: &mut App) -> bool {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => return true,
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+        KeyCode::Char('/') => app.mode = Mode::Search(SearchState::new()),
         KeyCode::Char(' ') => control_toggle(cfg, app).await,
         KeyCode::Char('n') => control_next(cfg, app).await,
         KeyCode::Char('p') => control_prev(cfg, app).await,
@@ -124,6 +206,152 @@ async fn handle_key(key: KeyEvent, cfg: &Config, app: &mut App) -> bool {
         _ => {}
     }
     false
+}
+
+/// 検索オーバーレイのキー処理。同期でクエリ/選択を更新し、必要な非同期アクションを実行する。
+async fn handle_search_key(key: KeyEvent, cfg: &Config, app: &mut App) {
+    // まず借用を閉じてからアクションを実行する（非同期処理は app を再借用するため）。
+    let action = {
+        let Mode::Search(state) = &mut app.mode else {
+            return;
+        };
+        search_key_action(key, state)
+    };
+    match action {
+        SearchAction::None => {}
+        SearchAction::Close => app.mode = Mode::Normal,
+        SearchAction::Submit(q) => run_search(cfg, app, &q).await,
+        SearchAction::Play(uri) => play_uri(cfg, app, uri).await,
+        SearchAction::BackToInput => {
+            if let Mode::Search(state) = &mut app.mode {
+                // 入力に戻る＝クエリを組み直す想定。古い結果と選択は破棄する。
+                state.phase = SearchPhase::Input;
+                state.results.clear();
+                state.selected = 0;
+                state.message = None;
+            }
+        }
+    }
+}
+
+/// クエリ/選択を同期更新し、必要な非同期アクションを返す。
+fn search_key_action(key: KeyEvent, state: &mut SearchState) -> SearchAction {
+    match state.phase {
+        SearchPhase::Input => match key.code {
+            KeyCode::Esc => SearchAction::Close,
+            KeyCode::Enter => {
+                if state.query.trim().is_empty() {
+                    SearchAction::None
+                } else {
+                    SearchAction::Submit(state.query.clone())
+                }
+            }
+            KeyCode::Backspace => {
+                state.query.pop();
+                SearchAction::None
+            }
+            KeyCode::Char(c) => {
+                state.query.push(c);
+                SearchAction::None
+            }
+            _ => SearchAction::None,
+        },
+        SearchPhase::Results => match key.code {
+            KeyCode::Esc => SearchAction::BackToInput,
+            KeyCode::Up => {
+                state.selected = state.selected.saturating_sub(1);
+                SearchAction::None
+            }
+            KeyCode::Down => {
+                if state.selected + 1 < state.results.len() {
+                    state.selected += 1;
+                }
+                SearchAction::None
+            }
+            KeyCode::Enter => match state.results.get(state.selected) {
+                Some(hit) => SearchAction::Play(hit.uri.clone()),
+                None => SearchAction::None,
+            },
+            _ => SearchAction::None,
+        },
+    }
+}
+
+/// クエリでトラック検索し、結果フェーズへ遷移する。失敗時は入力フェーズに留めて案内する。
+async fn run_search(cfg: &Config, app: &mut App, q: &str) {
+    match search_tracks(cfg, q).await {
+        Ok(hits) => {
+            let message = hits
+                .is_empty()
+                .then(|| format!("\"{q}\" に一致するトラックはありませんでした"));
+            app.mode = Mode::Search(SearchState {
+                query: q.to_string(),
+                phase: SearchPhase::Results,
+                results: hits,
+                selected: 0,
+                message,
+            });
+        }
+        Err(e) => {
+            app.status = format!("⚠ 検索に失敗: {e}");
+            if let Mode::Search(state) = &mut app.mode {
+                state.phase = SearchPhase::Input;
+                state.message = Some(format!("検索に失敗しました: {e}"));
+            }
+        }
+    }
+}
+
+async fn search_tracks(cfg: &Config, q: &str) -> Result<Vec<TrackHit>> {
+    let spotify = auth::authed_client(cfg).await?;
+    let result = spotify
+        .search(q, SearchType::Track, None, None, Some(SEARCH_LIMIT), None)
+        .await
+        .context("検索に失敗しました")?;
+    let SearchResult::Tracks(page) = result else {
+        anyhow::bail!("検索結果の形式が想定外です");
+    };
+    Ok(page.items.into_iter().filter_map(track_to_hit).collect())
+}
+
+/// 再生可能な（URI を持つ）トラックだけ `TrackHit` に写す。ローカル曲等は除外する。
+fn track_to_hit(t: FullTrack) -> Option<TrackHit> {
+    let uri = t.id.as_ref()?.uri();
+    let artists: Vec<String> = t.artists.into_iter().map(|a| a.name).collect();
+    Some(TrackHit {
+        name: t.name,
+        artists: join_artists(&artists),
+        uri,
+    })
+}
+
+/// 選択トラックの URI を再生する。成功したら通常表示へ戻り、失敗はオーバーレイに残して
+/// メッセージで伝える（検索画面は `app.status` を描画しないため、ここでは `state.message` に出す）。
+async fn play_uri(cfg: &Config, app: &mut App, uri: String) {
+    match play_track(cfg, &uri).await {
+        Ok(()) => {
+            app.status = "▶ 再生を開始しました".to_string();
+            app.last_poll = None; // 再生開始を素早く画面へ反映
+            app.mode = Mode::Normal;
+        }
+        Err(e) => {
+            if let Mode::Search(state) = &mut app.mode {
+                state.message = Some(format!("再生に失敗しました: {e}"));
+            } else {
+                app.status = format!("⚠ 再生に失敗: {e}");
+            }
+        }
+    }
+}
+
+async fn play_track(cfg: &Config, uri: &str) -> Result<()> {
+    let id = TrackId::from_uri(uri).context("トラック URI の解析に失敗しました")?;
+    let spotify = auth::authed_client(cfg).await?;
+    spotify
+        .start_uris_playback([PlayableId::Track(id)], None, None, None)
+        .await
+        .context("再生の開始に失敗しました（アクティブなデバイスが必要かもしれません）")?;
+    Ok(())
 }
 
 // ---- API 連携 ---------------------------------------------------------------
@@ -301,6 +529,14 @@ fn install_panic_hook() {
 // ---- 描画 -------------------------------------------------------------------
 
 fn draw(frame: &mut ratatui::Frame, app: &App) {
+    match &app.mode {
+        Mode::Normal => draw_now(frame, app),
+        Mode::Search(state) => draw_search(frame, state),
+    }
+}
+
+/// 通常（Now Playing）表示。
+fn draw_now(frame: &mut ratatui::Frame, app: &App) {
     let area = frame.area();
     let outer = Block::default()
         .borders(Borders::ALL)
@@ -346,9 +582,72 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     frame.render_widget(Paragraph::new(v.device), rows[5]);
     frame.render_widget(Paragraph::new(app.status.clone()), rows[7]);
     frame.render_widget(
-        Paragraph::new("space ⏯   n ⏭   p ⏮   +/- 音量   r 更新   q 終了")
+        Paragraph::new("space ⏯   n ⏭   p ⏮   +/- 音量   / 検索   r 更新   q 終了")
             .alignment(Alignment::Center)
             .style(Style::default().add_modifier(Modifier::DIM)),
         rows[8],
+    );
+}
+
+/// 検索オーバーレイ表示（入力欄 + 結果リスト）。
+fn draw_search(frame: &mut ratatui::Frame, state: &SearchState) {
+    let area = frame.area();
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(" spoterm — 検索 ");
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // 入力欄
+            Constraint::Length(1), // 補足
+            Constraint::Min(1),    // 結果リスト
+            Constraint::Length(1), // フッター
+        ])
+        .split(inner);
+
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+
+    // 入力欄（入力フェーズのみカーソルを出す）。
+    let cursor = if state.phase == SearchPhase::Input {
+        "▌"
+    } else {
+        ""
+    };
+    frame.render_widget(
+        Paragraph::new(format!("検索: {}{}", state.query, cursor)).style(bold),
+        rows[0],
+    );
+
+    // 補足行（メッセージ優先、無ければフェーズ別の案内）。
+    let hint = state.message.clone().unwrap_or_else(|| {
+        view::search_hint(state.phase == SearchPhase::Input, state.results.len())
+    });
+    frame.render_widget(Paragraph::new(hint).style(dim), rows[1]);
+
+    // 結果リスト（選択位置をハイライト）。
+    let width = inner.width as usize;
+    let items: Vec<ListItem> = state
+        .results
+        .iter()
+        .map(|h| ListItem::new(view::search_row(&h.name, &h.artists, width)))
+        .collect();
+    let mut list_state = ListState::default();
+    if !state.results.is_empty() {
+        list_state.select(Some(state.selected));
+    }
+    let list = List::new(items)
+        .highlight_symbol("▶ ")
+        .highlight_style(bold);
+    frame.render_stateful_widget(list, rows[2], &mut list_state);
+
+    frame.render_widget(
+        Paragraph::new("入力 → Enter 検索   ↑↓ 選択   Enter 再生   Esc 戻る   Ctrl-C 終了")
+            .alignment(Alignment::Center)
+            .style(dim),
+        rows[3],
     );
 }

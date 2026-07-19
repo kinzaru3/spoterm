@@ -107,6 +107,26 @@ pub fn render_lines(now: Option<&NowPlaying>, elapsed_ms: u128, width: usize) ->
     }
 }
 
+/// 検索オーバーレイの補足行（`message` が無いときの既定案内）。フェーズと件数で出し分ける。
+pub fn search_hint(is_input: bool, results_len: usize) -> String {
+    if is_input {
+        "Enter で検索 / Esc で戻る".to_string()
+    } else {
+        format!("{results_len} 件 — ↑↓ 選択 / Enter 再生 / Esc でクエリ修正")
+    }
+}
+
+/// 検索結果 1 行を整形する（`name — artists`、幅で末尾省略）。選択強調は呼び出し側で行う。
+/// 選択記号 `"▶ "` の 2 桁ぶんを差し引いた幅で省略する。
+pub fn search_row(name: &str, artists: &str, width: usize) -> String {
+    let text = if artists.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name} — {artists}")
+    };
+    truncate(&text, width.saturating_sub(2))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +194,28 @@ mod tests {
         assert_eq!(out.state, "再生中の曲はありません");
         assert!(out.artist.is_empty());
         assert_eq!(out.ratio, 0.0);
+    }
+
+    #[test]
+    fn search_row_joins_name_and_artists() {
+        assert_eq!(search_row("Song", "Artist", 80), "Song — Artist");
+        // アーティスト無しは曲名のみ
+        assert_eq!(search_row("Song", "", 80), "Song");
+    }
+
+    #[test]
+    fn search_row_truncates_with_symbol_margin() {
+        // width 10 → 記号 2 桁ぶんを引いた 8 文字で省略（末尾は …）
+        let out = search_row("abcdefghij", "", 10);
+        assert_eq!(out.chars().count(), 8);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn search_hint_varies_by_phase() {
+        assert!(search_hint(true, 0).contains("Enter で検索"));
+        let results = search_hint(false, 3);
+        assert!(results.starts_with("3 件"));
+        assert!(results.contains("Enter 再生"));
     }
 }
