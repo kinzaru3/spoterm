@@ -23,7 +23,7 @@ use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph};
 use rspotify::AuthCodePkceSpotify;
 use rspotify::model::{
@@ -49,6 +49,8 @@ const SEEK_STEP_MS: i64 = 5_000;
 const MAX_POLL_FAILURES: u32 = 3;
 /// 検索時に取得する上限件数。
 const SEARCH_LIMIT: u32 = 10;
+/// ステータス行を自動クリアするまでの表示時間。
+const STATUS_TTL: Duration = Duration::from_secs(4);
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -58,6 +60,32 @@ enum Mode {
     Search(SearchState),
     Browse(browse::BrowseState),
     Devices(devices::DevicePickerState),
+    /// キー一覧のヘルプオーバーレイ（表示専用・状態なし）。
+    Help,
+}
+
+/// `Mode` の種別（データを持たない判別子）。キー処理を網羅的 `match` にして、
+/// 新しい `Mode` を足したとき分岐漏れをコンパイルエラーで検出させるために使う
+/// （借用を保持しない `matches!` の if/else 連鎖では漏れが検出できないため）。
+#[derive(Clone, Copy)]
+enum ModeKind {
+    Normal,
+    Search,
+    Browse,
+    Devices,
+    Help,
+}
+
+impl Mode {
+    fn kind(&self) -> ModeKind {
+        match self {
+            Mode::Normal => ModeKind::Normal,
+            Mode::Search(_) => ModeKind::Search,
+            Mode::Browse(_) => ModeKind::Browse,
+            Mode::Devices(_) => ModeKind::Devices,
+            Mode::Help => ModeKind::Help,
+        }
+    }
 }
 
 /// 検索オーバーレイの状態。
@@ -173,6 +201,10 @@ async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify) -> Result<()
         saved_checked: false,
     };
 
+    // ステータス行の自動クリア用（変化を検知して計時。App には持たせず本ループ内で完結）。
+    let mut last_status = app.status.clone();
+    let mut status_since = Instant::now();
+
     loop {
         // `last_poll` が None のときは強制ポーリング（起動直後・操作直後・`r`）。タイマー起因の
         // 自動更新は連続失敗が閾値未満のときだけ行う（無効トークンでの毎 2 秒リトライを避ける）。
@@ -181,6 +213,20 @@ async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify) -> Result<()
         if forced || (timer_due && app.poll_failures < MAX_POLL_FAILURES) {
             poll_playback(&mut app).await;
             app.last_poll = Some(Instant::now());
+        }
+
+        // ステータスが変化したら計時をリセットし、一定時間経過で自動クリアする。
+        // （自動更新停止の案内は status ではなく poll_failures から draw_now が描くため消えない。）
+        if app.status != last_status {
+            last_status = app.status.clone();
+            status_since = Instant::now();
+        }
+        // 失敗継続中（poll_failures > 0）は消さない。同一エラーが繰り返されて計時が再開せず
+        // 途中で消える事故を防ぐ（回復時は poll_playback が古い警告を消す）。
+        if app.poll_failures == 0 && !app.status.is_empty() && status_since.elapsed() >= STATUS_TTL
+        {
+            app.status.clear();
+            last_status.clear();
         }
 
         terminal.draw(|frame| draw(frame, &app))?;
@@ -204,17 +250,25 @@ async fn handle_key(key: KeyEvent, app: &mut App) -> bool {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return true;
     }
-    if matches!(app.mode, Mode::Search(_)) {
-        handle_search_key(key, app).await;
-        false
-    } else if matches!(app.mode, Mode::Browse(_)) {
-        handle_browse_key(key, app).await;
-        false
-    } else if matches!(app.mode, Mode::Devices(_)) {
-        handle_devices_key(key, app).await;
-        false
-    } else {
-        handle_normal_key(key, app).await
+    match app.mode.kind() {
+        ModeKind::Search => {
+            handle_search_key(key, app).await;
+            false
+        }
+        ModeKind::Browse => {
+            handle_browse_key(key, app).await;
+            false
+        }
+        ModeKind::Devices => {
+            handle_devices_key(key, app).await;
+            false
+        }
+        ModeKind::Help => {
+            // ヘルプは表示専用。どのキーでも閉じて通常表示へ戻る（Ctrl-C は上の分岐で終了済み）。
+            app.mode = Mode::Normal;
+            false
+        }
+        ModeKind::Normal => handle_normal_key(key, app).await,
     }
 }
 
@@ -225,6 +279,7 @@ async fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
         KeyCode::Char('/') => app.mode = Mode::Search(SearchState::new()),
         KeyCode::Char('2') => load_browse(app, browse::BrowseTab::Playlists).await,
         KeyCode::Char('d') => open_devices(app).await,
+        KeyCode::Char('?') => app.mode = Mode::Help,
         KeyCode::Char(' ') => control_toggle(app).await,
         KeyCode::Char('n') => control_next(app).await,
         KeyCode::Char('p') => control_prev(app).await,
@@ -394,6 +449,8 @@ async fn play_track(app: &App, uri: &str) -> Result<()> {
 
 /// 再生状況を取得して `app.now` を更新する。失敗はステータス行に出す。
 async fn poll_playback(app: &mut App) {
+    // 回復（直前まで失敗が続いていた）を検知して、残っている警告表示を消すのに使う。
+    let was_failing = app.poll_failures > 0;
     match fetch_playback(app).await {
         Ok(Some(np)) => {
             // 曲が変わったら保存状態を破棄し、次で取り直す（毎ポーリングではなく変化時のみ）。
@@ -404,6 +461,11 @@ async fn poll_playback(app: &mut App) {
             }
             app.now = Some(np);
             app.poll_failures = 0;
+            // 回復時、残っているのが古い ⚠ 警告のときだけ消す（直前のユーザー操作で
+            // 出た正当なメッセージ＝Ok/Info は消さない）。
+            if was_failing && view::status_kind(&app.status) == view::StatusKind::Warn {
+                app.status.clear();
+            }
             refresh_saved(app).await;
         }
         Ok(None) => {
@@ -411,6 +473,9 @@ async fn poll_playback(app: &mut App) {
             app.saved = None;
             app.saved_checked = false;
             app.poll_failures = 0;
+            if was_failing && view::status_kind(&app.status) == view::StatusKind::Warn {
+                app.status.clear();
+            }
         }
         Err(e) => {
             app.poll_failures = app.poll_failures.saturating_add(1);
@@ -881,7 +946,51 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
         Mode::Search(state) => draw_search(frame, state),
         Mode::Browse(state) => draw_browse(frame, state),
         Mode::Devices(state) => draw_devices(frame, state),
+        Mode::Help => draw_help(frame),
     }
+}
+
+/// ヘルプ表示（全キーバインド一覧）。単一情報源 `view::help_entries()` から組み立てる。
+fn draw_help(frame: &mut ratatui::Frame) {
+    let area = frame.area();
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(" spoterm — ヘルプ ");
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),    // キー一覧
+            Constraint::Length(1), // フッター
+        ])
+        .split(inner);
+
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+
+    // `キー` 部分を右寄せ幅で揃えて読みやすくする（表示幅で計算）。
+    let key_width = view::help_entries()
+        .iter()
+        .map(|(k, _)| crate::format::display_width(k))
+        .max()
+        .unwrap_or(0);
+    let items: Vec<ListItem> = view::help_entries()
+        .iter()
+        .map(|(key, desc)| {
+            let pad = key_width.saturating_sub(crate::format::display_width(key));
+            ListItem::new(format!("  {key}{}   {desc}", " ".repeat(pad)))
+        })
+        .collect();
+    frame.render_widget(List::new(items).highlight_style(bold), rows[0]);
+
+    frame.render_widget(
+        Paragraph::new("何かキーを押すと戻ります（Esc / ? / q）")
+            .alignment(Alignment::Center)
+            .style(dim),
+        rows[1],
+    );
 }
 
 /// 通常（Now Playing）表示。
@@ -929,13 +1038,27 @@ fn draw_now(frame: &mut ratatui::Frame, app: &App) {
         rows[4],
     );
     frame.render_widget(Paragraph::new(v.device), rows[5]);
-    frame.render_widget(Paragraph::new(app.status.clone()), rows[7]);
-    frame.render_widget(
-        Paragraph::new(
-            "space ⏯  n ⏭  p ⏮  ←→ シーク  +/- 音量  s ♥  / 検索  2 ライブラリ  d デバイス  r 更新  q 終了",
+
+    // ステータス行: 自動更新が停止していれば案内を常時表示（status 自動クリアで消えないよう
+    // poll_failures から描く）。通常時は種別で色分けする。
+    let (status_text, status_style) = if app.poll_failures >= MAX_POLL_FAILURES {
+        (
+            "⚠ 自動更新を停止中です。r で再試行 / q で終了".to_string(),
+            Style::default().fg(Color::Red),
         )
-        .alignment(Alignment::Center)
-        .style(Style::default().add_modifier(Modifier::DIM)),
+    } else {
+        let style = match view::status_kind(&app.status) {
+            view::StatusKind::Warn => Style::default().fg(Color::Red),
+            view::StatusKind::Ok => Style::default().fg(Color::Green),
+            view::StatusKind::Info => Style::default().add_modifier(Modifier::DIM),
+        };
+        (app.status.clone(), style)
+    };
+    frame.render_widget(Paragraph::new(status_text).style(status_style), rows[7]);
+    frame.render_widget(
+        Paragraph::new("? ヘルプ   q 終了")
+            .alignment(Alignment::Center)
+            .style(Style::default().add_modifier(Modifier::DIM)),
         rows[8],
     );
 }

@@ -3,7 +3,7 @@
 
 use std::time::Instant;
 
-use crate::format::{format_ms, truncate};
+use crate::format::{display_width, format_ms, truncate};
 
 /// 直近のポーリングで得た再生状況のスナップショット。`fetched_at` を基点に、
 /// ポーリング間の進捗をローカルで補間して滑らかに見せる。
@@ -83,7 +83,7 @@ pub fn render_lines(
     let line = |label: &str, value: &str| -> String {
         format!(
             "{label}{}",
-            truncate(value, width.saturating_sub(label.chars().count()))
+            truncate(value, width.saturating_sub(display_width(label)))
         )
     };
 
@@ -184,6 +184,49 @@ pub fn device_row(
         text.push_str(" (操作不可)");
     }
     truncate(&text, width.saturating_sub(2))
+}
+
+/// キーバインド一覧（キー, 説明）。フッターとヘルプオーバーレイの唯一の情報源
+/// （両者がここを参照することで表記のドリフトを防ぐ）。
+pub fn help_entries() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("space", "再生 / 一時停止"),
+        ("n / p", "次の曲 / 前の曲"),
+        ("← / →", "5 秒シーク（戻る / 進む）"),
+        ("+ / -", "音量 ±5"),
+        ("s", "現在曲を保存 / 解除"),
+        ("/", "検索して再生"),
+        ("2", "ライブラリ閲覧"),
+        ("d", "デバイス選択"),
+        ("r", "更新（自動更新の再開）"),
+        ("?", "このヘルプ"),
+        ("q / Esc", "終了"),
+        ("Ctrl-C", "終了（どの画面でも）"),
+    ]
+}
+
+/// ステータス行の種別。色分けの判断に使う。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StatusKind {
+    Warn,
+    Ok,
+    Info,
+}
+
+/// ステータス文字列を種別に分類する純粋関数。`⚠` 始まりは警告、操作成功の記号始まりは Ok、
+/// それ以外は Info（起動中・案内文など）。
+pub fn status_kind(s: &str) -> StatusKind {
+    let trimmed = s.trim_start();
+    if trimmed.starts_with('⚠') {
+        StatusKind::Warn
+    } else if ["▶", "⏸", "⏭", "⏮", "🔊", "♥", "♡", "⏩"]
+        .iter()
+        .any(|p| trimmed.starts_with(p))
+    {
+        StatusKind::Ok
+    } else {
+        StatusKind::Info
+    }
 }
 
 #[cfg(test)]
@@ -340,9 +383,40 @@ mod tests {
 
     #[test]
     fn device_row_truncates_with_symbol_margin() {
-        // width 10 → 記号 2 桁ぶんを引いた 8 文字で末尾省略
+        // width 10 → 記号 2 桁ぶんを引いた 8 列で末尾省略
         let out = device_row("abcdefghij", "X", None, false, false, 10);
-        assert_eq!(out.chars().count(), 8);
+        assert!(crate::format::display_width(&out) <= 8);
         assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn help_entries_cover_all_keys() {
+        let keys: Vec<&str> = help_entries().iter().map(|(k, _)| *k).collect();
+        for k in [
+            "space",
+            "n / p",
+            "← / →",
+            "+ / -",
+            "s",
+            "/",
+            "2",
+            "d",
+            "r",
+            "?",
+            "q / Esc",
+        ] {
+            assert!(keys.contains(&k), "help に {k} が無い");
+        }
+        // 説明は空でない
+        assert!(help_entries().iter().all(|(_, desc)| !desc.is_empty()));
+    }
+
+    #[test]
+    fn status_kind_classifies() {
+        assert_eq!(status_kind("⚠ 更新失敗: x"), StatusKind::Warn);
+        assert_eq!(status_kind("▶ 再生"), StatusKind::Ok);
+        assert_eq!(status_kind("♥ ライブラリに保存しました"), StatusKind::Ok);
+        assert_eq!(status_kind("⏩ シーク 1:23"), StatusKind::Ok);
+        assert_eq!(status_kind("起動中…"), StatusKind::Info);
     }
 }
