@@ -10,7 +10,6 @@
 mod art;
 mod browse;
 mod devices;
-mod theme;
 mod view;
 
 use std::io::{self, Stdout};
@@ -40,6 +39,7 @@ use rspotify::prelude::*;
 use crate::auth;
 use crate::config::Config;
 use crate::format::join_artists;
+use crate::theme;
 use view::NowPlaying;
 
 /// Interval for re-fetching the playback status.

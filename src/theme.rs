@@ -1,15 +1,12 @@
-//! Central theme for the TUI: Nerd Font icon glyphs and the Spotify-like accent color.
+//! Central theme: Nerd Font icon glyphs and the Spotify-like accent color, shared by the TUI and
+//! the `login` command's console output.
 //!
 //! This is the single source of truth so that icon rendering, the status-line classifier
-//! ([`super::view::status_kind`]), and their tests all reference the *same* constants. Changing a
-//! glyph here must keep those in sync — hence the shared definitions.
+//! (`tui::view::status_kind`), and their tests all reference the *same* constants. Changing a glyph
+//! here must keep those in sync — hence the shared definitions.
 //!
 //! Icons are Nerd Font (v3) Private Use Area glyphs and require a patched Nerd Font in the user's
 //! terminal (documented as a requirement in the README). Without one, they render as tofu (□).
-
-// The constants are consumed incrementally by later steps (view.rs, mod.rs, auth.rs). Allow
-// dead_code until every glyph is wired up; this attribute is removed once all are in use.
-#![allow(dead_code)]
 
 use ratatui::style::Color;
 

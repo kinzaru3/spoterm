@@ -11,6 +11,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
 use crate::config::{self, Config};
+use crate::theme;
 
 /// Token cache file name (under the config directory).
 const TOKEN_CACHE_FILE: &str = "token.json";
@@ -260,12 +261,12 @@ pub async fn login(cfg: &Config) -> Result<()> {
     match spotify.current_user().await {
         Ok(user) => {
             let who = user.display_name.unwrap_or_else(|| "(no name)".to_string());
-            println!("✅ Login successful: {who}");
+            println!("{} Login successful: {who}", theme::CHECK);
         }
         // The token itself is already saved. Failing to fetch user info alone is not fatal, but keep it for diagnostics.
         Err(e) => {
             eprintln!("failed to fetch user info: {e}");
-            println!("✅ Login successful (token obtained)");
+            println!("{} Login successful (token obtained)", theme::CHECK);
         }
     }
     println!("   Token saved: {}", cache.display());
