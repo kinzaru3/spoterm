@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod format;
 mod np_json;
+mod theme;
 mod tui;
 
 use anyhow::Result;

@@ -39,6 +39,7 @@ use rspotify::prelude::*;
 use crate::auth;
 use crate::config::Config;
 use crate::format::join_artists;
+use crate::theme;
 use view::NowPlaying;
 
 /// Interval for re-fetching the playback status.
@@ -427,7 +428,7 @@ async fn run_search(app: &mut App, q: &str) {
             });
         }
         Err(e) => {
-            app.status = format!("⚠ search failed: {e}");
+            app.status = format!("{} search failed: {e}", theme::WARN);
             if let Mode::Search(state) = &mut app.mode {
                 state.phase = SearchPhase::Input;
                 state.message = Some(format!("search failed: {e}"));
@@ -466,7 +467,7 @@ fn track_to_hit(t: FullTrack) -> Option<TrackHit> {
 async fn play_selection(app: &mut App, uris: &[String], selected: usize) {
     match start_playback_queue(app, uris, selected).await {
         Ok(()) => {
-            app.status = "▶ Playback started".to_string();
+            app.status = format!("{} Playback started", theme::PLAY);
             app.last_poll = None; // Reflect playback start on screen quickly
             app.mode = Mode::Normal;
         }
@@ -474,7 +475,7 @@ async fn play_selection(app: &mut App, uris: &[String], selected: usize) {
             if let Mode::Search(state) = &mut app.mode {
                 state.message = Some(format!("playback failed: {e}"));
             } else {
-                app.status = format!("⚠ playback failed: {e}");
+                app.status = format!("{} playback failed: {e}", theme::WARN);
             }
         }
     }
@@ -541,9 +542,12 @@ async fn poll_playback(app: &mut App) {
         Err(e) => {
             app.poll_failures = app.poll_failures.saturating_add(1);
             app.status = if app.poll_failures >= MAX_POLL_FAILURES {
-                format!("⚠ auto-refresh stopped ({e}). Press r to retry / q to quit")
+                format!(
+                    "{} auto-refresh stopped ({e}). Press r to retry / q to quit",
+                    theme::WARN
+                )
             } else {
-                format!("⚠ refresh failed: {e}")
+                format!("{} refresh failed: {e}", theme::WARN)
             };
         }
     }
@@ -633,7 +637,7 @@ async fn ensure_ready(app: &mut App) -> bool {
     match auth::ensure_fresh_token(&app.client).await {
         Ok(()) => true,
         Err(e) => {
-            app.status = format!("⚠ {e}");
+            app.status = format!("{} {e}", theme::WARN);
             false
         }
     }
@@ -647,8 +651,10 @@ fn finish<E: std::fmt::Display>(app: &mut App, res: Result<(), E>, ok: &str) {
             app.last_poll = None; // Reflect the change on screen quickly
         }
         Err(e) => {
-            app.status =
-                format!("⚠ operation failed: {e} (press d to select and activate a device)");
+            app.status = format!(
+                "{} operation failed: {e} (press d to select and activate a device)",
+                theme::WARN
+            );
         }
     }
 }
@@ -661,10 +667,10 @@ async fn control_toggle(app: &mut App) {
     // To avoid a borrow conflict, settle the result first, then pass it to finish (&mut app).
     if playing {
         let res = app.client.pause_playback(None).await;
-        finish(app, res, "⏸ Paused");
+        finish(app, res, &format!("{} Paused", theme::PAUSE));
     } else {
         let res = app.client.resume_playback(None, None).await;
-        finish(app, res, "▶ Playing");
+        finish(app, res, &format!("{} Playing", theme::PLAY));
     }
 }
 
@@ -673,7 +679,7 @@ async fn control_next(app: &mut App) {
         return;
     }
     let res = app.client.next_track(None).await;
-    finish(app, res, "⏭ Next track");
+    finish(app, res, &format!("{} Next track", theme::NEXT));
 }
 
 async fn control_prev(app: &mut App) {
@@ -681,12 +687,15 @@ async fn control_prev(app: &mut App) {
         return;
     }
     let res = app.client.previous_track(None).await;
-    finish(app, res, "⏮ Previous track");
+    finish(app, res, &format!("{} Previous track", theme::PREV));
 }
 
 async fn control_volume(app: &mut App, delta: i16) {
     let Some(cur) = app.now.as_ref().and_then(|n| n.volume) else {
-        app.status = "⚠ device volume is unavailable (press d to select a device)".to_string();
+        app.status = format!(
+            "{} device volume is unavailable (press d to select a device)",
+            theme::WARN
+        );
         return;
     };
     let next = (cur as i16 + delta).clamp(0, 100) as u8;
@@ -694,7 +703,7 @@ async fn control_volume(app: &mut App, delta: i16) {
         return;
     }
     let res = app.client.volume(next, None).await;
-    finish(app, res, &format!("🔊 Volume {next}%"));
+    finish(app, res, &format!("{} Volume {next}%", theme::VOLUME));
 }
 
 /// Fetch the current track's saved state and update `app.saved`. Best-effort: query only when
@@ -742,7 +751,7 @@ async fn refresh_art(app: &mut App) {
         Ok(img) => app.art = Some(app.picker.new_resize_protocol(img)),
         Err(e) => {
             app.art = None;
-            app.status = format!("⚠ failed to fetch cover art: {e}");
+            app.status = format!("{} failed to fetch cover art: {e}", theme::WARN);
         }
     }
 }
@@ -753,7 +762,7 @@ async fn refresh_art(app: &mut App) {
 /// accumulate from the locally updated progress.
 async fn control_seek(app: &mut App, delta_ms: i64) {
     let Some(n) = app.now.as_ref() else {
-        app.status = "⚠ nothing is playing".to_string();
+        app.status = format!("{} nothing is playing", theme::WARN);
         return;
     };
     let elapsed = n.fetched_at.elapsed().as_millis();
@@ -775,10 +784,13 @@ async fn control_seek(app: &mut App, delta_ms: i64) {
                 n.progress_ms = target;
                 n.fetched_at = Instant::now();
             }
-            app.status = format!("⏩ Seek {}", crate::format::format_ms(target));
+            app.status = format!("{} Seek {}", theme::SEEK, crate::format::format_ms(target));
         }
         Err(e) => {
-            app.status = format!("⚠ seek failed: {e} (press d to select and activate a device)");
+            app.status = format!(
+                "{} seek failed: {e} (press d to select and activate a device)",
+                theme::WARN
+            );
         }
     }
 }
@@ -786,13 +798,16 @@ async fn control_seek(app: &mut App, delta_ms: i64) {
 /// Save/unsave the current track in the library (`s`). Toggles to the opposite of the current saved state, updating it on success.
 async fn control_save(app: &mut App) {
     let Some(uri) = app.now.as_ref().and_then(|n| n.track_uri.clone()) else {
-        app.status = "⚠ cannot save the current track (track info is unknown)".to_string();
+        app.status = format!(
+            "{} cannot save the current track (track info is unknown)",
+            theme::WARN
+        );
         return;
     };
     let id = match TrackId::from_uri(&uri) {
         Ok(id) => id,
         Err(e) => {
-            app.status = format!("⚠ failed to parse the track URI: {e}");
+            app.status = format!("{} failed to parse the track URI: {e}", theme::WARN);
             return;
         }
     };
@@ -811,13 +826,13 @@ async fn control_save(app: &mut App) {
             app.saved = Some(want_save);
             app.saved_checked = true;
             app.status = if want_save {
-                "♥ Saved to your library".to_string()
+                format!("{} Saved to your library", theme::HEART)
             } else {
-                "♡ Removed from your library".to_string()
+                format!("{} Removed from your library", theme::HEART_O)
             };
         }
         Err(e) => {
-            app.status = format!("⚠ save operation failed: {e}");
+            app.status = format!("{} save operation failed: {e}", theme::WARN);
         }
     }
 }
@@ -866,7 +881,7 @@ async fn load_browse(app: &mut App, tab: browse::BrowseTab) {
                     if let Mode::Browse(state) = &mut app.mode {
                         state.message = Some(format!("failed to fetch: {e}"));
                     } else {
-                        app.status = format!("⚠ failed to fetch the library: {e}");
+                        app.status = format!("{} failed to fetch the library: {e}", theme::WARN);
                     }
                     return;
                 }
@@ -895,7 +910,7 @@ async fn browse_play(app: &mut App) {
     };
     match browse::play(&app.client, &target).await {
         Ok(()) => {
-            app.status = "▶ Playback started".to_string();
+            app.status = format!("{} Playback started", theme::PLAY);
             app.last_poll = None;
             app.mode = Mode::Normal;
         }
@@ -903,7 +918,7 @@ async fn browse_play(app: &mut App) {
             if let Mode::Browse(state) = &mut app.mode {
                 state.message = Some(format!("playback failed: {e}"));
             } else {
-                app.status = format!("⚠ playback failed: {e}");
+                app.status = format!("{} playback failed: {e}", theme::WARN);
             }
         }
     }
@@ -937,7 +952,7 @@ async fn open_devices(app: &mut App) {
             if let Mode::Devices(state) = &mut app.mode {
                 state.message = Some(format!("failed to fetch: {e}"));
             } else {
-                app.status = format!("⚠ failed to fetch the device list: {e}");
+                app.status = format!("{} failed to fetch the device list: {e}", theme::WARN);
             }
             return;
         }
@@ -984,7 +999,7 @@ async fn devices_transfer(app: &mut App) {
     };
     match devices::transfer(&app.client, id).await {
         Ok(()) => {
-            app.status = format!("▶ Moved playback to '{}'", target.name);
+            app.status = format!("{} Moved playback to '{}'", theme::PLAY, target.name);
             app.last_poll = None; // Reflect the transfer into Now Playing quickly
             app.mode = Mode::Normal;
         }
@@ -992,7 +1007,7 @@ async fn devices_transfer(app: &mut App) {
             if let Mode::Devices(state) = &mut app.mode {
                 state.message = Some(format!("transfer failed: {e}"));
             } else {
-                app.status = format!("⚠ transfer failed: {e}");
+                app.status = format!("{} transfer failed: {e}", theme::WARN);
             }
         }
     }
@@ -1066,6 +1081,7 @@ fn draw_help(frame: &mut ratatui::Frame) {
     let area = frame.area();
     let outer = Block::default()
         .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::GREEN))
         .title(" spotterm — Help ");
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
@@ -1109,6 +1125,7 @@ fn draw_now(frame: &mut ratatui::Frame, app: &mut App) {
     let area = frame.area();
     let outer = Block::default()
         .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::GREEN))
         .title(" spotterm — Now Playing ");
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
@@ -1162,7 +1179,10 @@ fn draw_now(frame: &mut ratatui::Frame, app: &mut App) {
     );
 
     let bold = Style::default().add_modifier(Modifier::BOLD);
-    frame.render_widget(Paragraph::new(v.state).style(bold), rows[0]);
+    let accent = Style::default()
+        .fg(theme::GREEN)
+        .add_modifier(Modifier::BOLD);
+    frame.render_widget(Paragraph::new(v.state).style(accent), rows[0]);
     frame.render_widget(Paragraph::new(v.title).style(bold), rows[1]);
     frame.render_widget(Paragraph::new(v.artist), rows[2]);
     frame.render_widget(Paragraph::new(v.album), rows[3]);
@@ -1170,6 +1190,7 @@ fn draw_now(frame: &mut ratatui::Frame, app: &mut App) {
         Gauge::default()
             .ratio(v.ratio)
             .label(v.progress_label)
+            .gauge_style(Style::default().fg(theme::GREEN))
             .use_unicode(true),
         rows[4],
     );
@@ -1179,13 +1200,16 @@ fn draw_now(frame: &mut ratatui::Frame, app: &mut App) {
     // it does not vanish with the status auto-clear). Otherwise, color by kind.
     let (status_text, status_style) = if app.poll_failures >= MAX_POLL_FAILURES {
         (
-            "⚠ auto-refresh is stopped. Press r to retry / q to quit".to_string(),
+            format!(
+                "{} auto-refresh is stopped. Press r to retry / q to quit",
+                theme::WARN
+            ),
             Style::default().fg(Color::Red),
         )
     } else {
         let style = match view::status_kind(&app.status) {
             view::StatusKind::Warn => Style::default().fg(Color::Red),
-            view::StatusKind::Ok => Style::default().fg(Color::Green),
+            view::StatusKind::Ok => Style::default().fg(theme::GREEN),
             view::StatusKind::Info => Style::default().add_modifier(Modifier::DIM),
         };
         (app.status.clone(), style)
@@ -1206,10 +1230,14 @@ fn draw_now(frame: &mut ratatui::Frame, app: &mut App) {
         if let Some(art) = app.art.as_mut() {
             frame.render_stateful_widget(StatefulImage::default(), area, art);
         } else {
-            let placeholder = Paragraph::new("♪\n\n(no art)")
+            let placeholder = Paragraph::new(format!("{}\n\n(no art)", theme::MUSIC))
                 .alignment(Alignment::Center)
                 .style(Style::default().add_modifier(Modifier::DIM))
-                .block(Block::default().borders(Borders::ALL));
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(theme::GREEN)),
+                );
             frame.render_widget(placeholder, area);
         }
     }
@@ -1220,6 +1248,7 @@ fn draw_browse(frame: &mut ratatui::Frame, state: &browse::BrowseState) {
     let area = frame.area();
     let outer = Block::default()
         .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::GREEN))
         .title(" spotterm — Library ");
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
@@ -1270,9 +1299,11 @@ fn draw_browse(frame: &mut ratatui::Frame, state: &browse::BrowseState) {
     if !state.items.is_empty() {
         list_state.select(Some(state.selected));
     }
-    let list = List::new(items)
-        .highlight_symbol("▶ ")
-        .highlight_style(bold);
+    let list = List::new(items).highlight_symbol("▶ ").highlight_style(
+        Style::default()
+            .fg(theme::GREEN)
+            .add_modifier(Modifier::BOLD),
+    );
     frame.render_stateful_widget(list, rows[2], &mut list_state);
 
     frame.render_widget(
@@ -1288,6 +1319,7 @@ fn draw_devices(frame: &mut ratatui::Frame, state: &devices::DevicePickerState) 
     let area = frame.area();
     let outer = Block::default()
         .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::GREEN))
         .title(" spotterm — Devices ");
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
@@ -1301,7 +1333,6 @@ fn draw_devices(frame: &mut ratatui::Frame, state: &devices::DevicePickerState) 
         ])
         .split(inner);
 
-    let bold = Style::default().add_modifier(Modifier::BOLD);
     let dim = Style::default().add_modifier(Modifier::DIM);
 
     let hint = state.message.clone().unwrap_or_else(|| {
@@ -1332,9 +1363,11 @@ fn draw_devices(frame: &mut ratatui::Frame, state: &devices::DevicePickerState) 
     if !state.items.is_empty() {
         list_state.select(Some(state.selected));
     }
-    let list = List::new(items)
-        .highlight_symbol("▶ ")
-        .highlight_style(bold);
+    let list = List::new(items).highlight_symbol("▶ ").highlight_style(
+        Style::default()
+            .fg(theme::GREEN)
+            .add_modifier(Modifier::BOLD),
+    );
     frame.render_stateful_widget(list, rows[1], &mut list_state);
 
     frame.render_widget(
@@ -1350,6 +1383,7 @@ fn draw_search(frame: &mut ratatui::Frame, state: &SearchState) {
     let area = frame.area();
     let outer = Block::default()
         .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::GREEN))
         .title(" spotterm — Search ");
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
@@ -1395,9 +1429,11 @@ fn draw_search(frame: &mut ratatui::Frame, state: &SearchState) {
     if !state.results.is_empty() {
         list_state.select(Some(state.selected));
     }
-    let list = List::new(items)
-        .highlight_symbol("▶ ")
-        .highlight_style(bold);
+    let list = List::new(items).highlight_symbol("▶ ").highlight_style(
+        Style::default()
+            .fg(theme::GREEN)
+            .add_modifier(Modifier::BOLD),
+    );
     frame.render_stateful_widget(list, rows[2], &mut list_state);
 
     frame.render_widget(
