@@ -10,6 +10,7 @@
 mod art;
 mod browse;
 mod devices;
+mod theme;
 mod view;
 
 use std::io::{self, Stdout};
