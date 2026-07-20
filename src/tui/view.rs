@@ -206,6 +206,7 @@ pub fn help_entries() -> &'static [(&'static str, &'static str)] {
         ("+ / -", "volume ±5"),
         ("s", "save / unsave the current track"),
         ("/", "search and play"),
+        ("tab", "focus panel"),
         ("2", "browse library"),
         ("d", "select device"),
         ("r", "refresh (resume auto-refresh)"),
@@ -250,6 +251,44 @@ const MIN_FOOTER_HEIGHT: u16 = 12;
 /// Below this inner height the visualizer pane is dropped (checked after the footer, i.e. 12 → 10),
 /// so degradation removes the footer first and the visualizer second.
 const MIN_VISUALIZER_HEIGHT: u16 = 10;
+
+/// Which lower dashboard pane currently holds keyboard focus. Only the lower two panes (library and
+/// detail) are navigable; the upper Now Playing / Visualizer panes are display-only, so they are not
+/// part of the focus cycle. Kept a small, exhaustively-matched enum so adding a future focus target
+/// surfaces missing branches as compile errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    /// The lower-left library pane.
+    Library,
+    /// The lower-right detail pane.
+    Detail,
+}
+
+impl Focus {
+    /// The focus after a `tab` press, given whether the detail pane is currently shown. With the
+    /// detail pane hidden (narrow terminal) there is only one navigable pane, so focus stays on the
+    /// library — the stored focus is clamped *at the moment of navigation*, not just at render time.
+    /// This keeps `App.focus` always consistent with what is on screen, so widening the terminal
+    /// later never makes focus "jump" to a pane the user did not deliberately move to.
+    pub fn next(self, detail_visible: bool) -> Focus {
+        if !detail_visible {
+            return Focus::Library;
+        }
+        match self {
+            Focus::Library => Focus::Detail,
+            Focus::Detail => Focus::Library,
+        }
+    }
+
+    /// The focus that should actually be rendered, given whether the detail pane is currently shown.
+    /// A render-time safety belt: even though `next` already clamps on navigation, the terminal can
+    /// be resized between a key press and the next draw, so clamp here too. On a narrow terminal the
+    /// detail pane is hidden, so focus can never rest on a pane the user cannot see — it clamps back
+    /// to the library instead of silently highlighting nothing.
+    pub fn effective(self, detail_visible: bool) -> Focus {
+        if detail_visible { self } else { Focus::Library }
+    }
+}
 
 /// The dashboard regions carved out of the inner area (inside the outer border). Optional regions
 /// are `None` when the terminal is too small (or, for `search_bar`, when search is inactive) so the
@@ -837,6 +876,33 @@ mod tests {
     }
 
     #[test]
+    fn focus_next_swaps_lower_panes_when_detail_visible() {
+        assert_eq!(Focus::Library.next(true), Focus::Detail);
+        assert_eq!(Focus::Detail.next(true), Focus::Library);
+    }
+
+    #[test]
+    fn focus_next_stays_on_library_when_detail_hidden() {
+        // Narrow terminal: only one navigable pane, so tab clamps focus at navigation time (no
+        // hidden drift that would surface as a focus "jump" after the terminal is widened again).
+        assert_eq!(Focus::Library.next(false), Focus::Library);
+        assert_eq!(Focus::Detail.next(false), Focus::Library);
+    }
+
+    #[test]
+    fn focus_effective_clamps_to_library_when_detail_hidden() {
+        // A narrow terminal hides the detail pane, so focus must never rest on it.
+        assert_eq!(Focus::Detail.effective(false), Focus::Library);
+        assert_eq!(Focus::Library.effective(false), Focus::Library);
+    }
+
+    #[test]
+    fn focus_effective_keeps_stored_when_detail_visible() {
+        assert_eq!(Focus::Detail.effective(true), Focus::Detail);
+        assert_eq!(Focus::Library.effective(true), Focus::Library);
+    }
+
+    #[test]
     fn help_entries_cover_all_keys() {
         let keys: Vec<&str> = help_entries().iter().map(|(k, _)| *k).collect();
         for k in [
@@ -846,6 +912,7 @@ mod tests {
             "+ / -",
             "s",
             "/",
+            "tab",
             "2",
             "d",
             "r",

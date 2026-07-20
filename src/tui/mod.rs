@@ -167,6 +167,13 @@ struct App {
     poll_failures: u32,
     /// Screen mode (normal / search / library browse / device selection).
     mode: Mode,
+    /// Which lower dashboard pane holds keyboard focus (library / detail). `tab` toggles it. Only the
+    /// lower panes are navigable; the value clamps to `Library` when the detail pane is hidden.
+    focus: view::Focus,
+    /// Whether the detail pane was visible in the most recent draw (false on narrow terminals). Read
+    /// by the `tab` handler so focus navigation clamps to the panes actually on screen; updated by
+    /// `draw_dashboard`. Starts `false` — the first draw sets it before any key can be handled.
+    detail_visible: bool,
     /// Per-tab fetch-result cache for library browse (avoids re-fetching on tab switch).
     browse_cache: browse::BrowseCache,
     /// Whether the current track is saved in the library (`None` if undetermined). Re-fetched only on track change.
@@ -219,6 +226,8 @@ async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify, picker: Pick
         last_poll: None,
         poll_failures: 0,
         mode: Mode::Normal,
+        focus: view::Focus::Library,
+        detail_visible: false,
         browse_cache: browse::BrowseCache::default(),
         saved: None,
         saved_checked: false,
@@ -312,6 +321,10 @@ async fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => return true,
         KeyCode::Char('/') => app.mode = Mode::Search(SearchState::new()),
+        // Cycle keyboard focus between the two lower dashboard panes (library <-> detail). `next`
+        // clamps to the library when the detail pane was hidden in the last draw (narrow terminal),
+        // so focus never drifts to an off-screen pane.
+        KeyCode::Tab => app.focus = app.focus.next(app.detail_visible),
         KeyCode::Char('2') => load_browse(app, browse::BrowseTab::Playlists).await,
         KeyCode::Char('d') => open_devices(app).await,
         KeyCode::Char('?') => app.mode = Mode::Help,
@@ -1120,14 +1133,30 @@ fn draw_help(frame: &mut ratatui::Frame) {
     );
 }
 
-/// A dimmed, bordered placeholder pane (for regions not yet implemented in this phase). It is a
-/// visible label rather than an empty area, so the region never silently reads as broken.
-fn placeholder_pane(title: &str) -> Paragraph<'_> {
+/// A bordered placeholder pane (for regions not yet implemented in this phase). It is a visible
+/// label rather than an empty area, so the region never silently reads as broken. When `focused` is
+/// true the border is drawn in solid GREEN (the same accent used for selection elsewhere); otherwise
+/// it is dimmed. Display-only panes (e.g. Visualizer) always pass `focused = false`.
+fn placeholder_pane(title: &str, focused: bool) -> Paragraph<'_> {
     let dim = Style::default().add_modifier(Modifier::DIM);
+    let (text_style, border_style) = if focused {
+        (
+            Style::default(),
+            Style::default()
+                .fg(theme::GREEN)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (dim, dim)
+    };
     Paragraph::new(title)
         .alignment(Alignment::Center)
-        .style(dim)
-        .block(Block::default().borders(Borders::ALL).border_style(dim))
+        .style(text_style)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style),
+        )
 }
 
 /// Normal (dashboard) view. A thin orchestrator: it draws the outer frame, asks the pure
@@ -1161,20 +1190,33 @@ fn draw_dashboard(frame: &mut ratatui::Frame, app: &mut App) {
         .unwrap_or(0);
     let v = view::render_lines(app.now.as_ref(), elapsed, text_width as usize, app.saved);
 
-    // Placeholder panes for later phases (visible labels, never silently blank).
+    // Placeholder panes for later phases (visible labels, never silently blank). The focused lower
+    // pane is highlighted; focus clamps to the library when the detail pane is hidden (narrow term),
+    // so the highlight never lands on a pane the user cannot see. Visualizer is display-only.
+    let detail_visible = areas.detail.is_some();
+    // Record it so the `tab` key handler (which has no access to the frame size) can clamp focus
+    // navigation to the panes actually on screen.
+    app.detail_visible = detail_visible;
+    let focus = app.focus.effective(detail_visible);
     if let Some(vis) = areas.visualizer {
-        frame.render_widget(placeholder_pane("Visualizer"), vis);
+        frame.render_widget(placeholder_pane("Visualizer", false), vis);
     }
-    frame.render_widget(placeholder_pane("Library"), areas.library);
+    frame.render_widget(
+        placeholder_pane("Library", focus == view::Focus::Library),
+        areas.library,
+    );
     if let Some(detail) = areas.detail {
-        frame.render_widget(placeholder_pane("Details"), detail);
+        frame.render_widget(
+            placeholder_pane("Details", focus == view::Focus::Detail),
+            detail,
+        );
     }
 
     draw_status_line(frame, app, areas.status);
     draw_playbar(frame, v.ratio, &v.progress_label, areas.playbar);
     if let Some(footer) = areas.footer {
         frame.render_widget(
-            Paragraph::new("? help   q quit")
+            Paragraph::new("tab focus   ? help   q quit")
                 .alignment(Alignment::Center)
                 .style(Style::default().add_modifier(Modifier::DIM)),
             footer,
