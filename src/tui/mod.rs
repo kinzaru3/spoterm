@@ -467,7 +467,7 @@ fn track_to_hit(t: FullTrack) -> Option<TrackHit> {
 async fn play_selection(app: &mut App, uris: &[String], selected: usize) {
     match start_playback_queue(app, uris, selected).await {
         Ok(()) => {
-            app.status = "▶ Playback started".to_string();
+            app.status = format!("{} Playback started", theme::PLAY);
             app.last_poll = None; // Reflect playback start on screen quickly
             app.mode = Mode::Normal;
         }
@@ -667,10 +667,10 @@ async fn control_toggle(app: &mut App) {
     // To avoid a borrow conflict, settle the result first, then pass it to finish (&mut app).
     if playing {
         let res = app.client.pause_playback(None).await;
-        finish(app, res, "⏸ Paused");
+        finish(app, res, &format!("{} Paused", theme::PAUSE));
     } else {
         let res = app.client.resume_playback(None, None).await;
-        finish(app, res, "▶ Playing");
+        finish(app, res, &format!("{} Playing", theme::PLAY));
     }
 }
 
@@ -679,7 +679,7 @@ async fn control_next(app: &mut App) {
         return;
     }
     let res = app.client.next_track(None).await;
-    finish(app, res, "⏭ Next track");
+    finish(app, res, &format!("{} Next track", theme::NEXT));
 }
 
 async fn control_prev(app: &mut App) {
@@ -687,7 +687,7 @@ async fn control_prev(app: &mut App) {
         return;
     }
     let res = app.client.previous_track(None).await;
-    finish(app, res, "⏮ Previous track");
+    finish(app, res, &format!("{} Previous track", theme::PREV));
 }
 
 async fn control_volume(app: &mut App, delta: i16) {
@@ -784,7 +784,7 @@ async fn control_seek(app: &mut App, delta_ms: i64) {
                 n.progress_ms = target;
                 n.fetched_at = Instant::now();
             }
-            app.status = format!("⏩ Seek {}", crate::format::format_ms(target));
+            app.status = format!("{} Seek {}", theme::SEEK, crate::format::format_ms(target));
         }
         Err(e) => {
             app.status = format!(
@@ -910,7 +910,7 @@ async fn browse_play(app: &mut App) {
     };
     match browse::play(&app.client, &target).await {
         Ok(()) => {
-            app.status = "▶ Playback started".to_string();
+            app.status = format!("{} Playback started", theme::PLAY);
             app.last_poll = None;
             app.mode = Mode::Normal;
         }
@@ -999,7 +999,7 @@ async fn devices_transfer(app: &mut App) {
     };
     match devices::transfer(&app.client, id).await {
         Ok(()) => {
-            app.status = format!("▶ Moved playback to '{}'", target.name);
+            app.status = format!("{} Moved playback to '{}'", theme::PLAY, target.name);
             app.last_poll = None; // Reflect the transfer into Now Playing quickly
             app.mode = Mode::Normal;
         }

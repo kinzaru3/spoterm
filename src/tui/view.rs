@@ -460,4 +460,22 @@ mod tests {
         );
         assert_eq!(status_kind("starting…"), StatusKind::Info);
     }
+
+    #[test]
+    fn status_kind_recognizes_every_theme_prefix() {
+        // Guards the theme<->classifier contract: every glyph the app prefixes an "ok" status with
+        // (declared in theme::OK_PREFIXES) must classify as Ok, and the warning glyph as Warn. This
+        // catches drift where a status line is emitted with a glyph the classifier no longer matches.
+        for icon in theme::OK_PREFIXES {
+            assert_eq!(
+                status_kind(&format!("{icon} action done")),
+                StatusKind::Ok,
+                "ok prefix {icon:?} must classify as Ok"
+            );
+        }
+        assert_eq!(
+            status_kind(&format!("{} boom", theme::WARN)),
+            StatusKind::Warn
+        );
+    }
 }
