@@ -11,9 +11,9 @@ pub struct Config {
 
 impl Config {
     pub fn load() -> Result<Self> {
-        let client_id = std::env::var("SPOTERM_CLIENT_ID")
-            .context("SPOTERM_CLIENT_ID is not set (check your environment)")?;
-        let redirect_uri = std::env::var("SPOTERM_REDIRECT_URI")
+        let client_id = std::env::var("SPOTTERM_CLIENT_ID")
+            .context("SPOTTERM_CLIENT_ID is not set (check your environment)")?;
+        let redirect_uri = std::env::var("SPOTTERM_REDIRECT_URI")
             .unwrap_or_else(|_| "http://127.0.0.1:8888/callback".to_string());
         Ok(Self {
             client_id,
