@@ -5,10 +5,12 @@ on:
     branches: [main]
   pull_request:
 
-# Cancel superseded runs for the same ref to save CI minutes.
+# Cancel superseded PR runs to save CI minutes. main-branch runs must NOT be
+# cancelled: auto-release.yml only tags on a successful main CI run, so a
+# cancelled run would silently drop that version's release (see docs/release.md).
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Least privilege: this workflow only reads the repository.
 permissions:
