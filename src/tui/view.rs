@@ -4,6 +4,7 @@
 
 use std::time::Instant;
 
+use super::theme;
 use crate::format::{display_width, format_ms, truncate};
 
 /// A snapshot of the playback status from the most recent poll. Using `fetched_at` as the base,
@@ -68,11 +69,11 @@ pub struct RenderLines {
 
 /// A short marker for the current track's saved state (appended to the end of the state line).
 /// `None` means the state is unknown and nothing is shown.
-fn saved_marker(saved: Option<bool>) -> &'static str {
+fn saved_marker(saved: Option<bool>) -> String {
     match saved {
-        Some(true) => "   ♥ Saved",
-        Some(false) => "   ♡ Not saved",
-        None => "",
+        Some(true) => format!("   {} Saved", theme::HEART),
+        Some(false) => format!("   {} Not saved", theme::HEART_O),
+        None => String::new(),
     }
 }
 
@@ -106,9 +107,9 @@ pub fn render_lines(
 
     let prog = interpolate_progress(n.progress_ms, elapsed_ms, n.duration_ms, n.is_playing);
     let head = if n.is_playing {
-        "▶ Playing"
+        format!("{} Playing", theme::PLAY)
     } else {
-        "⏸ Paused"
+        format!("{} Paused", theme::PAUSE)
     };
     let vol = n
         .volume
@@ -117,16 +118,16 @@ pub fn render_lines(
 
     RenderLines {
         state: format!("{head}{}", saved_marker(saved)),
-        title: line("♪ ", &n.title),
-        artist: line("  ", &n.artists),
+        title: line(&format!("{} ", theme::MUSIC), &n.title),
+        artist: line(&format!("{} ", theme::ARTIST), &n.artists),
         album: n
             .album
             .as_deref()
-            .map(|a| line("  ", a))
+            .map(|a| line(&format!("{} ", theme::ALBUM), a))
             .unwrap_or_default(),
         ratio: progress_ratio(prog, n.duration_ms),
         progress_label: format!("{} / {}", format_ms(prog), format_ms(n.duration_ms)),
-        device: format!("🔈 {} (vol {vol})", n.device),
+        device: format!("{} {} (vol {vol})", theme::VOLUME, n.device),
     }
 }
 
@@ -220,16 +221,14 @@ pub enum StatusKind {
     Info,
 }
 
-/// Pure function that classifies a status string by kind. Starting with `⚠` is a warning, starting
-/// with a success symbol is Ok, and anything else is Info (startup, hint messages, etc.).
+/// Pure function that classifies a status string by kind. Starting with the warning glyph is a
+/// warning, starting with a success glyph is Ok, and anything else is Info (startup, hints, etc.).
+/// The glyphs come from [`theme`] so the classifier stays in sync with the strings the app emits.
 pub fn status_kind(s: &str) -> StatusKind {
     let trimmed = s.trim_start();
-    if trimmed.starts_with('⚠') {
+    if trimmed.starts_with(theme::WARN) {
         StatusKind::Warn
-    } else if ["▶", "⏸", "⏭", "⏮", "🔊", "♥", "♡", "⏩"]
-        .iter()
-        .any(|p| trimmed.starts_with(p))
-    {
+    } else if theme::OK_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
         StatusKind::Ok
     } else {
         StatusKind::Info
@@ -290,13 +289,35 @@ mod tests {
     fn render_lines_shows_track_and_progress() {
         let n = sample(true);
         let out = render_lines(Some(&n), 0, 80, None);
-        assert_eq!(out.state, "▶ Playing");
+        assert_eq!(out.state, format!("{} Playing", theme::PLAY));
         assert!(out.title.contains("Song"));
         assert!(out.artist.contains("Artist"));
         assert_eq!(out.progress_label, "1:00 / 3:00");
         assert_eq!(out.ratio, 60_000.0 / 180_000.0);
         assert!(out.device.contains("MacBook Pro"));
         assert!(out.device.contains("40%"));
+    }
+
+    #[test]
+    fn render_lines_prefixes_info_lines_with_icons() {
+        let n = sample(true);
+        let out = render_lines(Some(&n), 0, 80, None);
+        assert!(
+            out.title.starts_with(theme::MUSIC),
+            "title needs music icon"
+        );
+        assert!(
+            out.artist.starts_with(theme::ARTIST),
+            "artist needs artist icon"
+        );
+        assert!(
+            out.album.starts_with(theme::ALBUM),
+            "album needs album icon"
+        );
+        assert!(
+            out.device.starts_with(theme::VOLUME),
+            "device needs volume icon"
+        );
     }
 
     #[test]
@@ -310,19 +331,19 @@ mod tests {
     #[test]
     fn render_lines_shows_saved_marker() {
         let n = sample(true);
-        // Saved is ♥, not saved is ♡, unknown shows nothing
+        // Saved shows the filled heart, not-saved the empty heart, unknown shows neither.
         assert!(
             render_lines(Some(&n), 0, 80, Some(true))
                 .state
-                .contains("♥")
+                .contains(theme::HEART)
         );
         assert!(
             render_lines(Some(&n), 0, 80, Some(false))
                 .state
-                .contains("♡")
+                .contains(theme::HEART_O)
         );
         let unknown = render_lines(Some(&n), 0, 80, None).state;
-        assert!(!unknown.contains('♥') && !unknown.contains('♡'));
+        assert!(!unknown.contains(theme::HEART) && !unknown.contains(theme::HEART_O));
     }
 
     #[test]
@@ -421,10 +442,22 @@ mod tests {
 
     #[test]
     fn status_kind_classifies() {
-        assert_eq!(status_kind("⚠ refresh failed: x"), StatusKind::Warn);
-        assert_eq!(status_kind("▶ play"), StatusKind::Ok);
-        assert_eq!(status_kind("♥ saved to your library"), StatusKind::Ok);
-        assert_eq!(status_kind("⏩ seek 1:23"), StatusKind::Ok);
+        assert_eq!(
+            status_kind(&format!("{} refresh failed: x", theme::WARN)),
+            StatusKind::Warn
+        );
+        assert_eq!(
+            status_kind(&format!("{} play", theme::PLAY)),
+            StatusKind::Ok
+        );
+        assert_eq!(
+            status_kind(&format!("{} saved to your library", theme::HEART)),
+            StatusKind::Ok
+        );
+        assert_eq!(
+            status_kind(&format!("{} seek 1:23", theme::SEEK)),
+            StatusKind::Ok
+        );
         assert_eq!(status_kind("starting…"), StatusKind::Info);
     }
 }
