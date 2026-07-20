@@ -2,10 +2,11 @@
 
 **English** | [日本語](README.ja.md)
 
-A fast Spotify CLI & TUI for your terminal, built on the official Spotify Web API.
+A fast Spotify TUI for your terminal, built on the official Spotify Web API.
 
 spotterm controls playback, searches, browses your library, and shows a live "Now Playing"
-dashboard (with **album cover art** in supporting terminals). It uses **Authorization Code + PKCE**
+dashboard (with **album cover art** in supporting terminals) — all from a single interactive
+TUI. It uses **Authorization Code + PKCE**
 (no client secret on your machine) and talks only to the official Web API — it never downloads
 audio or bundles any Spotify SDK.
 
@@ -15,11 +16,13 @@ or mobile app); spotterm just tells that device what to play.
 ## Features
 
 - **Now Playing TUI** (`spotterm tui`): live track/artist/album, progress bar, volume, and **cover art**.
-- **Playback control**: play / pause / next / prev / seek / volume, from the CLI or the TUI.
+- **Playback control**: play / pause / next / prev / seek / volume, right from the TUI.
 - **Search & play** tracks.
 - **Browse & play** your playlists, saved tracks, and saved albums.
 - **Device picker**: list Connect devices and transfer playback.
 - **Save / unsave** the current track to your library.
+
+All actions live in the interactive TUI; the CLI has just two commands — `login` and `tui`.
 
 ## Requirements
 
@@ -76,20 +79,14 @@ git clone https://github.com/kinzaru3/spotterm && cd spotterm && cargo install -
 
 ## Usage
 
-### One-shot commands
+spotterm has just two commands:
 
 ```sh
-spotterm status                 # Now Playing (track / artist / progress / device)
-spotterm search <query>         # search tracks/albums/artists
-spotterm play [query]           # resume, or search and play
-spotterm pause | next | prev | toggle
-spotterm vol <0-100>            # set volume
-spotterm devices                # list available Connect devices
-spotterm device use <name>      # transfer playback to a device
-spotterm playlist ls            # list your playlists
-spotterm playlist play <name>   # play a playlist by name
-spotterm lib                    # list saved tracks / albums
+spotterm login   # authenticate once (PKCE; opens your browser, caches the token)
+spotterm tui     # launch the interactive Now Playing dashboard
 ```
+
+Everything — playback, search, library browsing, device switching — happens inside the TUI.
 
 ### Interactive TUI
 
