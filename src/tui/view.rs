@@ -96,7 +96,7 @@ pub fn render_lines(
     let Some(n) = now else {
         return RenderLines {
             state: "Nothing is playing".to_string(),
-            title: "  (press p to resume / `spotterm play` to start)".to_string(),
+            title: "  (press / to search, 2 to browse, d to select a device)".to_string(),
             artist: String::new(),
             album: String::new(),
             ratio: 0.0,
@@ -326,6 +326,15 @@ mod tests {
         assert_eq!(out.state, "Nothing is playing");
         assert!(out.artist.is_empty());
         assert_eq!(out.ratio, 0.0);
+        // The hint must guide with real TUI keys, not a removed CLI command (issue #27).
+        assert!(
+            !out.title.contains("spotterm"),
+            "must not reference a removed CLI command"
+        );
+        assert!(
+            out.title.contains("/ to search") && out.title.contains("d to select"),
+            "should point to real TUI keys (search / device)"
+        );
     }
 
     #[test]
