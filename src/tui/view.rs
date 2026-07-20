@@ -4,8 +4,8 @@
 
 use std::time::Instant;
 
-use super::theme;
 use crate::format::{display_width, format_ms, truncate};
+use crate::theme;
 
 /// A snapshot of the playback status from the most recent poll. Using `fetched_at` as the base,
 /// progress between polls is interpolated locally to look smooth.

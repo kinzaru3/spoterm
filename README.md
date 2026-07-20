@@ -31,6 +31,9 @@ All actions live in the interactive TUI; the CLI has just two commands — `logi
   logged in on the same account.
 - **Your own Spotify app Client ID** (free; see Setup). Each user registers their own app.
 - Rust toolchain (to build from source) — Rust 1.85+ (edition 2024).
+- **A [Nerd Font](https://www.nerdfonts.com/)** set as your terminal font. The TUI and the `login`
+  output use Nerd Font glyphs for icons (track, artist, album, volume, warnings, etc.); without one
+  they render as tofu (□).
 - For real album art: a terminal that supports an image protocol (iTerm2, kitty, WezTerm, Ghostty).
   Other terminals fall back to colored half-blocks automatically.
 
