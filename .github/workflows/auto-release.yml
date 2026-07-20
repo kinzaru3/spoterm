@@ -1,0 +1,86 @@
+name: Auto Release
+
+# release ブランチを main にマージすると CI（ci.yml）が走る。その CI が main で
+# 成功したら、Cargo.toml の version に対応する v タグが「未作成のときだけ」自動で
+# タグを打つ。release ブランチだけが version を bump するため、実質「release ブランチ
+# を main にマージしたとき」だけ発火する（マージ方式 squash/merge に依存しない）。
+#
+# 打ったタグの push は既存の release.yml（on: push tags: v*）を起動する。ただし
+# GitHub の仕様上、既定の GITHUB_TOKEN で push したタグは他ワークフローを起動しない
+# ため、ここでは PAT（RELEASE_TAG_TOKEN）で push する。
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+# GITHUB_TOKEN はタグ push に使わない（PAT を使う）ので読み取りのみで足りる。
+permissions:
+  contents: read
+
+# タグ付けは直列化する（同一 SHA への多重発火や競合を避ける）。
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: Tag on merge to main
+    runs-on: ubuntu-latest
+    # ハングした git push で auto-release の concurrency group を塞がないよう即座に失敗させる。
+    timeout-minutes: 10
+    # main への push で走った CI が成功したときだけ。PR 由来の CI run は除外する。
+    if: >-
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: Checkout merged commit
+        uses: actions/checkout@v4
+        with:
+          # CI が通ったまさにそのコミット（main のマージコミット）を対象にする。
+          ref: ${{ github.event.workflow_run.head_sha }}
+          # タグの有無を確認するため全履歴を取得する。
+          fetch-depth: 0
+          # PAT で checkout することで後続の git push もこの PAT を使い、
+          # タグ push が release.yml を起動できるようにする。
+          token: ${{ secrets.RELEASE_TAG_TOKEN }}
+
+      - name: Read version from Cargo.toml
+        id: ver
+        run: |
+          set -euo pipefail
+          # 単一パッケージの Cargo.toml 前提（先頭の version 行を採用）。
+          # workspace 化や別の version 行を上に追加した場合は要見直し。
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ -z "$version" ]; then
+            echo "::error::Cargo.toml から version を読み取れませんでした"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push tag if new
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          # 既にタグがある（＝リリース済み / version bump の無いマージ）なら何もしない。
+          # silent failure を避けるため必ずログを残す。
+          # annotated タグはタグオブジェクトと ^{}（commit）の 2 行が返る。最終行の SHA が
+          # 指し先 commit（lightweight は 1 行 = そのまま commit）。空なら未作成。
+          existing_sha="$(git ls-remote --tags origin "refs/tags/${TAG}" "refs/tags/${TAG}^{}" | awk 'END{print $1}')"
+          if [ -n "$existing_sha" ]; then
+            if [ "$existing_sha" != "$SHA" ]; then
+              # 同名タグが別コミットを指す（手動タグや中断跡など）。取り違えを検知させる。
+              echo "::warning::タグ ${TAG} は既存だが別コミット (${existing_sha}) を指しています。今回の ${SHA} には付与せずスキップします。"
+            else
+              echo "タグ ${TAG} は既に存在します。version bump の無いマージのためリリースをスキップします。"
+            fi
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" "${SHA}" -m "Release ${TAG}"
+          git push origin "${TAG}"
+          echo "タグ ${TAG} を push しました。release.yml がリリースを開始します。"
