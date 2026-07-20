@@ -60,9 +60,9 @@ git clone https://github.com/kinzaru3/spotterm && cd spotterm && cargo install -
    ```
 3. **Client ID を環境変数で指定**（または `.env` ファイル。`.env.example` 参照）:
    ```sh
-   export SPOTERM_CLIENT_ID=あなたの_client_id
+   export SPOTTERM_CLIENT_ID=あなたの_client_id
    # 任意（既定は http://127.0.0.1:8888/callback）
-   # export SPOTERM_REDIRECT_URI=http://127.0.0.1:8888/callback
+   # export SPOTTERM_REDIRECT_URI=http://127.0.0.1:8888/callback
    ```
 4. **ログイン**（ブラウザで同意 → トークンはローカルにキャッシュ）:
    ```sh

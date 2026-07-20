@@ -61,9 +61,9 @@ git clone https://github.com/kinzaru3/spotterm && cd spotterm && cargo install -
    ```
 3. **Provide your Client ID** via environment variable (or a `.env` file — see `.env.example`):
    ```sh
-   export SPOTERM_CLIENT_ID=your_client_id_here
+   export SPOTTERM_CLIENT_ID=your_client_id_here
    # optional, defaults to http://127.0.0.1:8888/callback
-   # export SPOTERM_REDIRECT_URI=http://127.0.0.1:8888/callback
+   # export SPOTTERM_REDIRECT_URI=http://127.0.0.1:8888/callback
    ```
 4. **Log in** (opens your browser for consent; the token is cached locally):
    ```sh
