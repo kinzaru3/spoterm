@@ -167,7 +167,7 @@ pub fn search_row(name: &str, artists: &str, width: usize) -> String {
     truncate(&text, width.saturating_sub(2))
 }
 
-/// Pure function that formats one device row (the TUI version of `commands::devices::render_device`).
+/// Pure function that formats one device row for the device picker.
 /// Active is shown with `● (active)`, inactive with `○`, and restricted is annotated.
 /// Truncates at a width reduced by the 2 columns of the selection marker `"▶ "`.
 pub fn device_row(

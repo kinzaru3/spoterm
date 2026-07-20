@@ -1,6 +1,5 @@
 //! Pure formatting helpers. They depend only on primitives (not rspotify model types) and
-//! return `String`, which keeps them unit-testable (command modules do the model→primitive
-//! mapping).
+//! return `String`, which keeps them unit-testable (the TUI does the model→primitive mapping).
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -51,21 +50,6 @@ pub fn truncate(s: &str, max: usize) -> String {
     format!("{head}…")
 }
 
-/// Format one list row. Omits `subtitle` when empty and appends `uri` only when non-empty.
-/// Shared by search / playlist ls / lib.
-pub fn render_entry(index: usize, title: &str, subtitle: &str, uri: &str) -> String {
-    let head = if subtitle.is_empty() {
-        format!("  {index}. {title}")
-    } else {
-        format!("  {index}. {title}  —  {subtitle}")
-    };
-    if uri.is_empty() {
-        head
-    } else {
-        format!("{head}    {uri}")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,23 +92,5 @@ mod tests {
         assert_eq!(display_width("あ"), 2); // full-width = 2 cols
         assert_eq!(display_width("🎵"), 2); // emoji = 2 cols
         assert_eq!(display_width("a あ"), 4); // 1 + 1(space) + 2
-    }
-
-    #[test]
-    fn render_entry_with_subtitle_and_uri() {
-        let out = render_entry(1, "Song", "Artist", "spotify:track:abc");
-        assert_eq!(out, "  1. Song  —  Artist    spotify:track:abc");
-    }
-
-    #[test]
-    fn render_entry_without_subtitle() {
-        let out = render_entry(2, "Artist", "", "spotify:artist:xyz");
-        assert_eq!(out, "  2. Artist    spotify:artist:xyz");
-    }
-
-    #[test]
-    fn render_entry_without_uri() {
-        let out = render_entry(3, "My Mix", "120 songs", "");
-        assert_eq!(out, "  3. My Mix  —  120 songs");
     }
 }

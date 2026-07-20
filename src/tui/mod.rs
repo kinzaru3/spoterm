@@ -592,14 +592,14 @@ fn snapshot_from_context(ctx: CurrentPlaybackContext) -> NowPlaying {
         }
         // Like the status command, extract a fallback from the raw JSON that fell to Unknown.
         Some(PlayableItem::Unknown(v)) => {
-            let (title, artists, album, dur) = crate::commands::status::track_from_json(&v);
-            let images = crate::commands::status::album_images_from_json(&v);
+            let (title, artists, album, dur) = crate::np_json::track_from_json(&v);
+            let images = crate::np_json::album_images_from_json(&v);
             (
                 title,
                 artists,
                 album,
                 dur,
-                crate::commands::status::track_id_from_json(&v),
+                crate::np_json::track_id_from_json(&v),
                 art::pick_image_url(&images),
             )
         }
