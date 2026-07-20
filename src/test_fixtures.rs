@@ -113,7 +113,14 @@ pub(crate) fn playback_unknown_track(name: &str, artist: &str) -> Value {
         "item": {
             "name": name,
             "artists": [{ "name": artist }],
-            "album": { "name": "Fallback Album" },
+            "album": {
+                "name": "Fallback Album",
+                "images": [
+                    { "url": "https://i.scdn.co/image/cover640", "width": 640, "height": 640 },
+                    { "url": "https://i.scdn.co/image/cover300", "width": 300, "height": 300 },
+                    { "url": "https://i.scdn.co/image/cover64", "width": 64, "height": 64 }
+                ]
+            },
             "duration_ms": 187_000,
             "uri": "spotify:track:4iV5W9uYEdYUVa79Axb7Rh"
         },

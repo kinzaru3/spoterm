@@ -7,7 +7,7 @@
 //!   locally with [`view::interpolate_progress`] to look smooth.
 //! - API errors are shown on the status line and the loop continues (no silent failures).
 
-mod art;
+use crate::art;
 mod browse;
 mod devices;
 mod view;

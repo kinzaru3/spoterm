@@ -12,20 +12,27 @@ use crate::format::{format_ms, join_artists};
 
 pub async fn run(cfg: &Config) -> Result<()> {
     let spotify = auth::authed_client(cfg).await?;
-    println!("{}", execute(&spotify).await?);
+    let (text, art_url) = execute(&spotify).await?;
+    println!("{text}");
+    // Show the cover art below the text (best-effort; no-op on non-TTY / when there is no art).
+    crate::art::show(art_url.as_deref()).await;
     Ok(())
 }
 
-/// Fetch the current playback and build the display block. Returns the text to print so the
-/// API glue (request + response mapping, including the Unknown fallback) is testable.
-async fn execute(spotify: &AuthCodePkceSpotify) -> Result<String> {
+/// Fetch the current playback and build the display block. Returns the text to print plus the
+/// cover-art URL to display, so the API glue (request + response mapping, including the Unknown
+/// fallback) is testable.
+async fn execute(spotify: &AuthCodePkceSpotify) -> Result<(String, Option<String>)> {
     let ctx = spotify
         .current_playback(None, None::<Vec<_>>)
         .await
         .context("failed to fetch playback status")?;
 
     let Some(ctx) = ctx else {
-        return Ok("Nothing is playing (start playback with `spotterm play`)".to_string());
+        return Ok((
+            "Nothing is playing (start playback with `spotterm play`)".to_string(),
+            None,
+        ));
     };
 
     let device = ctx.device.name;
@@ -33,6 +40,8 @@ async fn execute(spotify: &AuthCodePkceSpotify) -> Result<String> {
     // Convert rspotify's Duration (chrono) into non-negative milliseconds via a method,
     // without surfacing the type name.
     let progress_ms = ctx.progress.map(|d| d.num_milliseconds().max(0) as u128);
+    // Pick the cover-art URL before the match consumes `ctx.item`.
+    let art_url = ctx.item.as_ref().and_then(super::nowplaying::pick_art_url);
 
     let line = match ctx.item {
         Some(PlayableItem::Track(track)) => {
@@ -77,7 +86,7 @@ async fn execute(spotify: &AuthCodePkceSpotify) -> Result<String> {
         None => "Playing, but track info is unavailable (possibly an ad, etc.)".to_string(),
     };
 
-    Ok(line)
+    Ok((line, art_url))
 }
 
 /// Extract the values needed for display (title, artist names, album name, duration ms)
@@ -187,8 +196,9 @@ mod tests {
             .mount(&server)
             .await;
         let client = crate::auth::test_client(&server.uri()).await;
-        let out = execute(&client).await.unwrap();
+        let (out, art_url) = execute(&client).await.unwrap();
         assert!(out.contains("Nothing is playing"), "{out}");
+        assert_eq!(art_url, None);
     }
 
     #[tokio::test]
@@ -202,10 +212,12 @@ mod tests {
             .mount(&server)
             .await;
         let client = crate::auth::test_client(&server.uri()).await;
-        let out = execute(&client).await.unwrap();
+        let (out, art_url) = execute(&client).await.unwrap();
         assert!(out.contains("Fallback Song"), "{out}");
         assert!(out.contains("Fallback Artist"), "{out}");
         assert!(out.contains("Fallback Album"), "{out}");
+        // The Unknown fallback also surfaces the album cover art (300px is closest to target).
+        assert_eq!(art_url.as_deref(), Some("https://i.scdn.co/image/cover300"));
     }
 
     #[test]

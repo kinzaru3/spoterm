@@ -7,6 +7,7 @@ use rspotify::model::{Offset, PlayableId, SearchResult, SearchType};
 use rspotify::prelude::*;
 
 use super::NEED_DEVICE_HINT;
+use super::nowplaying;
 use crate::auth;
 use crate::config::Config;
 use crate::format::join_artists;
@@ -32,6 +33,8 @@ async fn exec_pause(spotify: &AuthCodePkceSpotify) -> Result<String> {
 pub async fn next(cfg: &Config) -> Result<()> {
     let spotify = auth::authed_client(cfg).await?;
     println!("{}", exec_next(&spotify).await?);
+    // Show the cover art of the track we advanced to (best-effort; waits for Connect to settle).
+    nowplaying::show_after_control(&spotify).await;
     Ok(())
 }
 
@@ -46,6 +49,8 @@ async fn exec_next(spotify: &AuthCodePkceSpotify) -> Result<String> {
 pub async fn prev(cfg: &Config) -> Result<()> {
     let spotify = auth::authed_client(cfg).await?;
     println!("{}", exec_prev(&spotify).await?);
+    // Show the cover art of the track we moved back to (best-effort; waits for Connect to settle).
+    nowplaying::show_after_control(&spotify).await;
     Ok(())
 }
 
@@ -73,50 +78,75 @@ async fn exec_vol(spotify: &AuthCodePkceSpotify, level: u8) -> Result<String> {
 
 pub async fn toggle(cfg: &Config) -> Result<()> {
     let spotify = auth::authed_client(cfg).await?;
-    println!("{}", exec_toggle(&spotify).await?);
+    let (msg, art_url) = exec_toggle(&spotify).await?;
+    println!("{msg}");
+    // Cover art is shown only when we resumed (art_url is Some). Resuming does not change the
+    // track, so it comes straight from the fetch exec_toggle already made — no re-fetch / no wait.
+    crate::art::show(art_url.as_deref()).await;
     Ok(())
 }
 
-async fn exec_toggle(spotify: &AuthCodePkceSpotify) -> Result<String> {
+/// Toggle play/pause. Returns the message plus the cover-art URL to display: `Some` on the resume
+/// branch (from the playback context already fetched here), `None` on pause / no-device.
+async fn exec_toggle(spotify: &AuthCodePkceSpotify) -> Result<(String, Option<String>)> {
     let ctx = spotify
         .current_playback(None, None::<Vec<_>>)
         .await
         .context("failed to fetch playback status")?;
 
-    let msg = match ctx {
+    let outcome = match ctx {
         Some(c) if c.is_playing => {
             spotify
                 .pause_playback(None)
                 .await
                 .context("failed to pause")?;
-            "⏸ Paused".to_string()
+            ("⏸ Paused".to_string(), None)
         }
-        Some(_) => {
+        Some(c) => {
             spotify
                 .resume_playback(None, None)
                 .await
                 .context("failed to resume playback")?;
-            "▶ Resumed playback".to_string()
+            // Resuming keeps the same track, so its art is already in the fetched context.
+            let art_url = c.item.as_ref().and_then(nowplaying::pick_art_url);
+            ("▶ Resumed playback".to_string(), art_url)
         }
-        None => "No active device. Select one with `spotterm device use <name>`".to_string(),
+        None => (
+            "No active device. Select one with `spotterm device use <name>`".to_string(),
+            None,
+        ),
     };
-    Ok(msg)
+    Ok(outcome)
 }
 
 pub async fn play(cfg: &Config, query: &[String]) -> Result<()> {
     let spotify = auth::authed_client(cfg).await?;
-    println!("{}", exec_play(&spotify, query).await?);
+    let (msg, art_url) = exec_play(&spotify, query).await?;
+    println!("{msg}");
+    if query.is_empty() {
+        // Resume: the now-playing track is whatever was paused (unchanged), so fetch its art now.
+        nowplaying::show_current_art(&spotify).await;
+    } else {
+        // Query: we started the top hit, so show its cover art directly (accurate, no settle).
+        crate::art::show(art_url.as_deref()).await;
+    }
     Ok(())
 }
 
-async fn exec_play(spotify: &AuthCodePkceSpotify, query: &[String]) -> Result<String> {
+/// Start playback and return the confirmation message plus the cover-art URL to display for the
+/// query path (the top hit's art). The resume / not-found paths return `None` (resume art is
+/// fetched separately by the caller).
+async fn exec_play(
+    spotify: &AuthCodePkceSpotify,
+    query: &[String],
+) -> Result<(String, Option<String>)> {
     // No arguments means resume.
     if query.is_empty() {
         spotify
             .resume_playback(None, None)
             .await
             .with_context(|| format!("failed to resume playback{NEED_DEVICE_HINT}"))?;
-        return Ok("▶ Resumed playback".to_string());
+        return Ok(("▶ Resumed playback".to_string(), None));
     }
 
     // With a query, search for the top matches and play them as a queue so `next`/`prev` work.
@@ -138,20 +168,21 @@ async fn exec_play(spotify: &AuthCodePkceSpotify, query: &[String]) -> Result<St
     };
 
     // Keep only playable tracks (those with a URI); local songs have no id and are skipped.
-    // Remember the top hit's name/artists for the confirmation message.
+    // Remember the top hit's name/artists (for the confirmation message) and album art (to display).
     let mut ids: Vec<_> = Vec::new();
-    let mut top: Option<(String, Vec<String>)> = None;
+    let mut top: Option<(String, Vec<String>, Option<String>)> = None;
     for track in page.items {
         let Some(id) = track.id else { continue };
         if top.is_none() {
             let artists = track.artists.into_iter().map(|a| a.name).collect();
-            top = Some((track.name, artists));
+            let art_url = crate::art::pick_from_images(&track.album.images);
+            top = Some((track.name, artists, art_url));
         }
         ids.push(id);
     }
 
-    let Some((name, artists)) = top else {
-        return Ok(format!("No track found matching \"{q}\""));
+    let Some((name, artists, art_url)) = top else {
+        return Ok((format!("No track found matching \"{q}\""), None));
     };
 
     // Start at the top hit; the rest stay queued behind it.
@@ -166,7 +197,10 @@ async fn exec_play(spotify: &AuthCodePkceSpotify, query: &[String]) -> Result<St
         .await
         .with_context(|| format!("failed to start playback{NEED_DEVICE_HINT}"))?;
 
-    Ok(format!("▶ Playing: {name} — {}", join_artists(&artists)))
+    Ok((
+        format!("▶ Playing: {name} — {}", join_artists(&artists)),
+        art_url,
+    ))
 }
 
 #[cfg(test)]
@@ -224,7 +258,10 @@ mod tests {
         let server = MockServer::start().await;
         mount_ok(&server, "PUT", "/me/player/play").await;
         let client = crate::auth::test_client(&server.uri()).await;
-        assert_eq!(exec_play(&client, &[]).await.unwrap(), "▶ Resumed playback");
+        assert_eq!(
+            exec_play(&client, &[]).await.unwrap(),
+            ("▶ Resumed playback".to_string(), None)
+        );
     }
 
     #[tokio::test]
@@ -250,8 +287,10 @@ mod tests {
             .mount(&server)
             .await;
         let client = crate::auth::test_client(&server.uri()).await;
-        let out = exec_play(&client, &["cool".to_string()]).await.unwrap();
+        let (out, art_url) = exec_play(&client, &["cool".to_string()]).await.unwrap();
         assert_eq!(out, "▶ Playing: Cool Song — The Artist");
+        // The search fixture carries no album images, so there is no cover art to display.
+        assert_eq!(art_url, None);
     }
 
     #[tokio::test]
@@ -263,8 +302,9 @@ mod tests {
             .mount(&server)
             .await;
         let client = crate::auth::test_client(&server.uri()).await;
-        let out = exec_toggle(&client).await.unwrap();
+        let (out, art_url) = exec_toggle(&client).await.unwrap();
         assert!(out.contains("No active device"), "{out}");
+        assert_eq!(art_url, None);
     }
 
     #[tokio::test]
@@ -286,7 +326,10 @@ mod tests {
             .mount(&server)
             .await;
         let client = crate::auth::test_client(&server.uri()).await;
-        assert_eq!(exec_toggle(&client).await.unwrap(), "⏸ Paused");
+        assert_eq!(
+            exec_toggle(&client).await.unwrap(),
+            ("⏸ Paused".to_string(), None)
+        );
     }
 
     #[tokio::test]
@@ -311,7 +354,7 @@ mod tests {
             .await;
         let client = crate::auth::test_client(&server.uri()).await;
 
-        let out = exec_play(&client, &["song".to_string()]).await.unwrap();
+        let (out, _art) = exec_play(&client, &["song".to_string()]).await.unwrap();
         assert_eq!(out, "▶ Playing: Song One — Artist A");
 
         // The play request must queue every match (so `next`/`prev` work) and start at the top hit.
@@ -341,7 +384,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = crate::auth::test_client(&server.uri()).await;
-        let out = exec_play(&client, &["nope".to_string()]).await.unwrap();
+        let (out, _art) = exec_play(&client, &["nope".to_string()]).await.unwrap();
         assert!(out.contains("No track found matching"), "{out}");
     }
 }

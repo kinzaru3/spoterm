@@ -1,3 +1,4 @@
+mod art;
 mod auth;
 mod cli;
 mod commands;
