@@ -4,6 +4,8 @@
 
 use std::time::Instant;
 
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+
 use crate::format::{display_width, format_ms, truncate};
 use crate::theme;
 
@@ -235,9 +237,416 @@ pub fn status_kind(s: &str) -> StatusKind {
     }
 }
 
+// ---- Dashboard layout (pure region splitting) -------------------------------
+
+/// Below this inner width the dashboard collapses to a single column (visualizer and detail are
+/// dropped) so the remaining panes stay legible on narrow terminals. The boundary is inclusive:
+/// a width of exactly this many columns still shows two columns.
+const MIN_TWO_COL_WIDTH: u16 = 60;
+/// Below this inner height the footer row is dropped first (its keys also live in the help overlay).
+/// The Now Playing pane needs ~5 text rows (state / title / artist / album / device) but only gets
+/// ~45% of the body, so the footer is only worth showing once the body is comfortably tall.
+const MIN_FOOTER_HEIGHT: u16 = 12;
+/// Below this inner height the visualizer pane is dropped (checked after the footer, i.e. 12 → 10),
+/// so degradation removes the footer first and the visualizer second.
+const MIN_VISUALIZER_HEIGHT: u16 = 10;
+
+/// The dashboard regions carved out of the inner area (inside the outer border). Optional regions
+/// are `None` when the terminal is too small (or, for `search_bar`, when search is inactive) so the
+/// caller simply skips drawing them.
+pub struct DashboardAreas {
+    /// Upper-left Now Playing pane (always present).
+    pub now_playing: Rect,
+    /// Upper-right visualizer pane (`None` on narrow or short terminals).
+    pub visualizer: Option<Rect>,
+    /// The search input row (`Some` only while search is active). Populated by the pure splitter and
+    /// asserted by unit tests; the Phase 1 `draw` calls with search inactive and does not render it
+    /// yet (search still uses its own overlay view), so it is not read from the binary target.
+    #[allow(dead_code)]
+    pub search_bar: Option<Rect>,
+    /// Lower-left library pane (always present).
+    pub library: Rect,
+    /// Lower-right detail pane (`None` on narrow terminals).
+    pub detail: Option<Rect>,
+    /// The status line. Its height is reserved arithmetically before any other row, so it is the
+    /// last thing to disappear as the terminal shrinks (it is the only non-silent output). It is
+    /// `>= 1` row whenever `inner.height >= 1`.
+    pub status: Rect,
+    /// The playback bar row. Reserved right after `status`, so it is `>= 1` row whenever
+    /// `inner.height >= 2`.
+    pub playbar: Rect,
+    /// The footer/key-hint row (`None` on short terminals).
+    pub footer: Option<Rect>,
+}
+
+/// Split the inner area (inside the outer border) into dashboard regions. Pure and
+/// terminal-independent (works on hand-built `Rect`s), so it is unit-testable without a backend.
+///
+/// The mandatory bottom rows are reserved with plain arithmetic (not the layout solver, which can
+/// collapse rows to height 0 on short terminals). Highest priority first: `status`, then `playbar`,
+/// then `footer` (only when tall enough); whatever remains becomes the body. Pseudocode:
+///
+/// ```text
+/// remaining = inner.height
+/// status_h  = min(remaining, 1); remaining -= status_h   // survives down to height 1
+/// playbar_h = min(remaining, 1); remaining -= playbar_h   // survives down to height 2
+/// footer_h  = show_footer ? min(remaining, 1) : 0; remaining -= footer_h
+/// body_h    = remaining                                   // upper + search bar + lower
+/// ```
+///
+/// The body is then split with the layout solver: vertically into `upper / (search_bar) / lower`
+/// (search bar only when `search_active`), and each of those horizontally into
+/// `now_playing / visualizer` and `library / detail` (single column when narrow/short).
+pub fn dashboard_areas(inner: Rect, search_active: bool) -> DashboardAreas {
+    let two_col = inner.width >= MIN_TWO_COL_WIDTH;
+    let show_footer = inner.height >= MIN_FOOTER_HEIGHT;
+    let show_visualizer = two_col && inner.height >= MIN_VISUALIZER_HEIGHT;
+
+    // 1. Reserve the mandatory bottom rows arithmetically, status first (see the doc comment). This
+    //    guarantees status/playbar never collapse to height 0 while the terminal can still show them,
+    //    which keeps the status line — the only non-silent output — visible.
+    let mut remaining = inner.height;
+    let status_h = remaining.min(1);
+    remaining -= status_h;
+    let playbar_h = remaining.min(1);
+    remaining -= playbar_h;
+    let footer_h = if show_footer { remaining.min(1) } else { 0 };
+    remaining -= footer_h;
+    let body_h = remaining;
+
+    // Stack the rows from the top: body, then status, playbar, footer along the bottom.
+    let x = inner.x;
+    let w = inner.width;
+    let mut y = inner.y;
+    let body = Rect::new(x, y, w, body_h);
+    y += body_h;
+    let status = Rect::new(x, y, w, status_h);
+    y += status_h;
+    let playbar = Rect::new(x, y, w, playbar_h);
+    y += playbar_h;
+    let footer = if show_footer {
+        Some(Rect::new(x, y, w, footer_h))
+    } else {
+        None
+    };
+
+    // 2. Split the body into upper / (search_bar) / lower.
+    let (upper, search_bar, lower) = if search_active {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(45),
+                Constraint::Length(1),
+                Constraint::Min(1),
+            ])
+            .split(body);
+        (rows[0], Some(rows[1]), rows[2])
+    } else {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .split(body);
+        (rows[0], None, rows[1])
+    };
+
+    // 3. Split the upper row into now_playing / visualizer.
+    let (now_playing, visualizer) = if show_visualizer {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(upper);
+        (cols[0], Some(cols[1]))
+    } else {
+        (upper, None)
+    };
+
+    // 4. Split the lower row into library / detail.
+    let (library, detail) = if two_col {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(41), Constraint::Percentage(59)])
+            .split(lower);
+        (cols[0], Some(cols[1]))
+    } else {
+        (lower, None)
+    };
+
+    DashboardAreas {
+        now_playing,
+        visualizer,
+        search_bar,
+        library,
+        detail,
+        status,
+        playbar,
+        footer,
+    }
+}
+
+/// Cover-art columns are square; terminal cells are about twice as tall as wide, so a column of
+/// `height * 2` columns renders roughly square.
+const ART_COL_ASPECT: u16 = 2;
+/// Never let the cover-art column exceed this many columns (keep room for the text).
+const ART_COL_MAX: u16 = 24;
+/// Below this many columns an art column is not worth showing; fall back to full-width text.
+const ART_COL_MIN: u16 = 4;
+
+/// The width (in columns) of the cover-art column inside the Now Playing pane, or `0` when no
+/// column is shown. Pure so the caller can subtract it from the pane width *before* building the
+/// text lines, keeping the truncation width in sync with the actual text rectangle. `want_art` is
+/// false when nothing is playing (no art to show). The column is square-ish (`pane_h * 2`), capped
+/// at half the pane width and [`ART_COL_MAX`]; anything under [`ART_COL_MIN`] collapses to `0`.
+pub fn art_col_width(pane_w: u16, pane_h: u16, want_art: bool) -> u16 {
+    if !want_art {
+        return 0;
+    }
+    let cols = pane_h
+        .saturating_mul(ART_COL_ASPECT)
+        .min(pane_w / 2)
+        .min(ART_COL_MAX);
+    if cols >= ART_COL_MIN { cols } else { 0 }
+}
+
+/// Allocate up to `count` single-row `Rect`s stacked from the top of `area`, dropping any that do
+/// not fit (so the caller can lay out priority-ordered rows without the layout solver collapsing an
+/// arbitrary one to height 0). Each returned rect is exactly one row tall and inside `area`. Reused
+/// for the Now Playing text rows (state / title / artist / album / device, highest priority first).
+pub fn stack_rows(area: Rect, count: usize) -> Vec<Rect> {
+    (0..count)
+        .map(|i| area.y.saturating_add(i as u16))
+        .take_while(|&y| y < area.bottom())
+        .map(|y| Rect::new(area.x, y, area.width, 1))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// True when `r` sits entirely inside `outer` (no boundary overflow).
+    fn within(outer: Rect, r: Rect) -> bool {
+        r.x >= outer.x
+            && r.y >= outer.y
+            && r.right() <= outer.right()
+            && r.bottom() <= outer.bottom()
+    }
+
+    #[test]
+    fn dashboard_normal_has_four_panes_and_stacked_bottom_rows() {
+        // Arrange
+        let inner = Rect::new(0, 0, 100, 30);
+
+        // Act
+        let a = dashboard_areas(inner, false);
+
+        // Assert: all optional panes present, no search bar.
+        let vis = a.visualizer.expect("visualizer present when wide/tall");
+        let detail = a.detail.expect("detail present when wide");
+        let footer = a.footer.expect("footer present when tall");
+        assert!(a.search_bar.is_none(), "no search bar when inactive");
+
+        // Upper panes are left/right neighbors on the same row.
+        assert_eq!(vis.x, a.now_playing.x + a.now_playing.width);
+        assert_eq!(vis.y, a.now_playing.y);
+        // Lower panes are left/right neighbors.
+        assert_eq!(detail.x, a.library.x + a.library.width);
+        assert_eq!(detail.y, a.library.y);
+        // Upper sits above lower.
+        assert!(a.now_playing.y < a.library.y);
+
+        // Bottom rows are each one line tall and stacked status → playbar → footer.
+        assert_eq!(a.status.height, 1);
+        assert_eq!(a.playbar.height, 1);
+        assert_eq!(footer.height, 1);
+        assert_eq!(a.playbar.y, a.status.y + 1);
+        assert_eq!(footer.y, a.playbar.y + 1);
+        // Footer is the bottom-most row.
+        assert_eq!(footer.bottom(), inner.bottom());
+    }
+
+    #[test]
+    fn dashboard_narrow_collapses_to_single_column() {
+        // Arrange
+        let inner = Rect::new(0, 0, 50, 30);
+
+        // Act
+        let a = dashboard_areas(inner, false);
+
+        // Assert
+        assert!(a.visualizer.is_none(), "no visualizer when narrow");
+        assert!(a.detail.is_none(), "no detail when narrow");
+        assert_eq!(a.now_playing.width, inner.width);
+        assert_eq!(a.library.width, inner.width);
+    }
+
+    #[test]
+    fn dashboard_short_drops_footer_before_visualizer() {
+        // Height 11: footer gone (< 12) but visualizer kept (>= 10).
+        let a = dashboard_areas(Rect::new(0, 0, 100, 11), false);
+        assert!(a.footer.is_none(), "footer dropped below 12 rows");
+        assert!(a.visualizer.is_some(), "visualizer kept at 11 rows");
+
+        // Height 9: both footer and visualizer gone (< 10).
+        let b = dashboard_areas(Rect::new(0, 0, 100, 9), false);
+        assert!(b.footer.is_none());
+        assert!(b.visualizer.is_none(), "visualizer dropped below 10 rows");
+    }
+
+    #[test]
+    fn dashboard_search_inserts_bar_between_upper_and_lower() {
+        // Arrange
+        let inner = Rect::new(0, 0, 100, 30);
+
+        // Act
+        let a = dashboard_areas(inner, true);
+
+        // Assert
+        let bar = a.search_bar.expect("search bar present when active");
+        assert_eq!(bar.height, 1);
+        assert!(a.now_playing.y < bar.y);
+        assert!(bar.y < a.library.y);
+    }
+
+    #[test]
+    fn dashboard_regions_stay_within_inner() {
+        let inner = Rect::new(3, 2, 100, 30);
+        let a = dashboard_areas(inner, true);
+        for r in [
+            Some(a.now_playing),
+            a.visualizer,
+            a.search_bar,
+            Some(a.library),
+            a.detail,
+            Some(a.status),
+            Some(a.playbar),
+            a.footer,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(within(inner, r), "region {r:?} escapes inner {inner:?}");
+        }
+    }
+
+    #[test]
+    fn dashboard_guarantees_status_then_playbar_on_tiny_heights() {
+        // Height 0 is degenerate: nothing can be drawn, so every row collapses to 0.
+        let a0 = dashboard_areas(Rect::new(0, 0, 100, 0), false);
+        assert_eq!(a0.status.height, 0, "no rows fit at height 0");
+        assert_eq!(a0.playbar.height, 0);
+
+        // From height 1 up, status must always survive (the only non-silent output); from height 2
+        // up, the playbar must too. Neither may overflow the inner area.
+        for h in 1..=4u16 {
+            let a = dashboard_areas(Rect::new(0, 0, 100, h), false);
+            assert!(a.status.height >= 1, "status must stay >= 1 at height {h}");
+            assert!(a.status.bottom() <= h, "status overflows at height {h}");
+            if h >= 2 {
+                assert!(
+                    a.playbar.height >= 1,
+                    "playbar must stay >= 1 at height {h}"
+                );
+                assert!(a.playbar.bottom() <= h, "playbar overflows at height {h}");
+            }
+        }
+    }
+
+    #[test]
+    fn dashboard_thresholds_are_inclusive_boundaries() {
+        // Width exactly at the two-column boundary keeps both columns; one below collapses.
+        let wide = dashboard_areas(Rect::new(0, 0, MIN_TWO_COL_WIDTH, 30), false);
+        assert!(wide.visualizer.is_some() && wide.detail.is_some());
+        let narrow = dashboard_areas(Rect::new(0, 0, MIN_TWO_COL_WIDTH - 1, 30), false);
+        assert!(narrow.visualizer.is_none() && narrow.detail.is_none());
+
+        // Height exactly at the footer threshold keeps the footer; one below drops it.
+        let with_footer = dashboard_areas(Rect::new(0, 0, 100, MIN_FOOTER_HEIGHT), false);
+        assert!(with_footer.footer.is_some());
+        let no_footer = dashboard_areas(Rect::new(0, 0, 100, MIN_FOOTER_HEIGHT - 1), false);
+        assert!(no_footer.footer.is_none());
+
+        // Height exactly at the visualizer threshold keeps it; one below drops it.
+        let with_vis = dashboard_areas(Rect::new(0, 0, 100, MIN_VISUALIZER_HEIGHT), false);
+        assert!(with_vis.visualizer.is_some());
+        let no_vis = dashboard_areas(Rect::new(0, 0, 100, MIN_VISUALIZER_HEIGHT - 1), false);
+        assert!(no_vis.visualizer.is_none());
+    }
+
+    #[test]
+    fn art_col_width_columnizes_only_when_wide_enough() {
+        // No art wanted (nothing playing) → no column.
+        assert_eq!(art_col_width(100, 20, false), 0);
+        // Wide and tall pane → capped at ART_COL_MAX (24) columns.
+        assert_eq!(art_col_width(100, 50, true), 24);
+        // Aspect-driven width (height*2) below the cap, bounded by half the pane width.
+        assert_eq!(art_col_width(40, 3, true), 6);
+        // Too narrow to host a >= ART_COL_MIN column → full-width text (0).
+        assert_eq!(art_col_width(6, 10, true), 0);
+    }
+
+    #[test]
+    fn art_col_width_lets_text_width_stay_positive() {
+        // Regression guard: the text width the caller derives (pane_w - art) must stay > 0 so
+        // render_lines truncates against the real text rectangle, not the whole pane.
+        let pane_w = 100u16;
+        let art = art_col_width(pane_w, 30, true);
+        assert!(
+            art > 0 && art < pane_w,
+            "art column must leave room for text"
+        );
+        assert!(pane_w - art > 0);
+    }
+
+    #[test]
+    fn stack_rows_allocates_from_top_and_drops_overflow() {
+        // Enough height: all rows fit, each one line tall, stacked top-down.
+        let full = stack_rows(Rect::new(0, 0, 10, 5), 5);
+        assert_eq!(full.len(), 5);
+        assert!(
+            full.iter()
+                .enumerate()
+                .all(|(i, r)| r.y == i as u16 && r.height == 1)
+        );
+        // Short area: only the top rows fit; lower (lower-priority) ones are dropped.
+        assert_eq!(stack_rows(Rect::new(0, 0, 10, 3), 5).len(), 3);
+        // Zero height: nothing fits.
+        assert!(stack_rows(Rect::new(2, 1, 10, 0), 5).is_empty());
+        // Respects the area offset.
+        let offset = stack_rows(Rect::new(3, 7, 10, 2), 5);
+        assert_eq!(offset.len(), 2);
+        assert_eq!((offset[0].x, offset[0].y), (3, 7));
+        assert_eq!(offset[1].y, 8);
+    }
+
+    #[test]
+    fn now_playing_rows_keep_top_priority_at_footer_boundary() {
+        // At the footer-threshold height the Now Playing pane is short, but its top rows
+        // (state / title / artist) must survive; only device/album may drop.
+        let a = dashboard_areas(Rect::new(0, 0, 100, MIN_FOOTER_HEIGHT), false);
+        let rows = stack_rows(a.now_playing, 5);
+        assert_eq!(
+            rows.len(),
+            4,
+            "state/title/artist/album survive, only device drops"
+        );
+        assert!(rows.iter().all(|r| r.height == 1), "no row is crushed to 0");
+        for pair in rows.windows(2) {
+            assert_eq!(pair[1].y, pair[0].y + 1, "rows stack contiguously");
+        }
+        // Rows stay inside the pane.
+        assert!(rows.iter().all(|r| within(a.now_playing, *r)));
+    }
+
+    #[test]
+    fn now_playing_rows_survive_tiny_pane_heights() {
+        // Sweep pane heights 1..=6: allocated row count == min(height, 5) and none is crushed.
+        for h in 1..=6u16 {
+            let pane = Rect::new(0, 0, 40, h);
+            let rows = stack_rows(pane, 5);
+            assert_eq!(rows.len() as u16, h.min(5), "row count at height {h}");
+            assert!(rows.iter().all(|r| r.height == 1), "no crush at height {h}");
+        }
+    }
 
     #[test]
     fn interpolate_advances_only_while_playing() {

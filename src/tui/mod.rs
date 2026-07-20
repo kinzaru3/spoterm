@@ -1056,7 +1056,7 @@ fn install_panic_hook() {
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     // Branch on ModeKind (Copy) to release the borrow immediately. Normal needs `&mut app` for image rendering.
     match app.mode.kind() {
-        ModeKind::Normal => draw_now(frame, app),
+        ModeKind::Normal => draw_dashboard(frame, app),
         ModeKind::Search => {
             if let Mode::Search(state) = &app.mode {
                 draw_search(frame, state);
@@ -1120,85 +1120,136 @@ fn draw_help(frame: &mut ratatui::Frame) {
     );
 }
 
-/// Normal (Now Playing) view. If cover art exists, place the image column on the left and text on the right.
-fn draw_now(frame: &mut ratatui::Frame, app: &mut App) {
+/// A dimmed, bordered placeholder pane (for regions not yet implemented in this phase). It is a
+/// visible label rather than an empty area, so the region never silently reads as broken.
+fn placeholder_pane(title: &str) -> Paragraph<'_> {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    Paragraph::new(title)
+        .alignment(Alignment::Center)
+        .style(dim)
+        .block(Block::default().borders(Borders::ALL).border_style(dim))
+}
+
+/// Normal (dashboard) view. A thin orchestrator: it draws the outer frame, asks the pure
+/// `view::dashboard_areas` to carve the inner area into regions, and hands each region to a focused
+/// sub-function. Regions returned as `None` (too small a terminal) are simply skipped. In this phase
+/// only Now Playing is real; the other panes are placeholders. The Now Playing pane is drawn last so
+/// its `&mut app.art` borrow comes after every immutable read of `app`.
+fn draw_dashboard(frame: &mut ratatui::Frame, app: &mut App) {
     let area = frame.area();
     let outer = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::GREEN))
-        .title(" spotterm — Now Playing ");
+        .title(" spotterm — tui ");
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
-    // While playing, give the left an image column (show a placeholder even if art is absent/not yet
-    // fetched to make the empty state explicit). The image is square; given a cell aspect ratio of
-    // about 1:2, aim for width ≈ height*2, capped at half the inner width and 24 columns. If too
-    // narrow, do not show a column (full-width text). Also no column when nothing is playing.
-    let want_art_col = app.art.is_some() || app.now.is_some();
-    let art_cols: u16 = if want_art_col {
-        inner.height.saturating_mul(2).min(inner.width / 2).min(24)
-    } else {
-        0
-    };
-    let (art_area, text_area) = if art_cols >= 4 {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(art_cols), Constraint::Min(1)])
-            .split(inner);
-        (Some(cols[0]), cols[1])
-    } else {
-        (None, inner)
-    };
+    // Phase 1 draws the dashboard with search inactive (search still uses its own overlay view).
+    let areas = view::dashboard_areas(inner, false);
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // state
-            Constraint::Length(1), // title
-            Constraint::Length(1), // artist
-            Constraint::Length(1), // album
-            Constraint::Length(1), // progress gauge
-            Constraint::Length(1), // device
-            Constraint::Min(1),    // spacer
-            Constraint::Length(1), // status
-            Constraint::Length(1), // footer (keys)
-        ])
-        .split(text_area);
-
-    // Building the display lines is delegated to the pure function `view::render_lines` (tested). Here it is only turned into widgets.
+    // Reserve the cover-art column first (pure), then build the display lines against the *text*
+    // width that actually remains. Passing the full pane width would make `truncate` think no
+    // truncation is needed and let the non-wrapping Paragraph clip the text with no ellipsis. `v`
+    // owns its strings, so it holds no borrow of `app` and is reused by both the pane and the playbar.
+    let want_art = app.art.is_some() || app.now.is_some();
+    let art_cols = view::art_col_width(areas.now_playing.width, areas.now_playing.height, want_art);
+    let text_width = areas.now_playing.width.saturating_sub(art_cols);
     let elapsed = app
         .now
         .as_ref()
         .map(|n| n.fetched_at.elapsed().as_millis())
         .unwrap_or(0);
-    let v = view::render_lines(
-        app.now.as_ref(),
-        elapsed,
-        text_area.width as usize,
-        app.saved,
-    );
+    let v = view::render_lines(app.now.as_ref(), elapsed, text_width as usize, app.saved);
 
+    // Placeholder panes for later phases (visible labels, never silently blank).
+    if let Some(vis) = areas.visualizer {
+        frame.render_widget(placeholder_pane("Visualizer"), vis);
+    }
+    frame.render_widget(placeholder_pane("Library"), areas.library);
+    if let Some(detail) = areas.detail {
+        frame.render_widget(placeholder_pane("Details"), detail);
+    }
+
+    draw_status_line(frame, app, areas.status);
+    draw_playbar(frame, v.ratio, &v.progress_label, areas.playbar);
+    if let Some(footer) = areas.footer {
+        frame.render_widget(
+            Paragraph::new("? help   q quit")
+                .alignment(Alignment::Center)
+                .style(Style::default().add_modifier(Modifier::DIM)),
+            footer,
+        );
+    }
+
+    // Draw the Now Playing pane last: it is the only region that borrows `&mut app` (for the cover
+    // art), so every immutable read above is already done. `art_cols` is the width already reserved
+    // above (0 = no column), reused here so the split matches the width `render_lines` was given.
+    draw_now_playing_pane(frame, app, areas.now_playing, art_cols, &v);
+}
+
+/// Draw the Now Playing pane: an optional cover-art column of `art_cols` columns on the left (0 =
+/// none) and the text lines on the right. The text rows are placed by `view::stack_rows` in priority
+/// order (state / title / artist / album / device), so a short pane drops the lower rows first
+/// instead of letting the layout solver crush an arbitrary one to height 0. Progress is shown by the
+/// bottom playbar, not here. The cover art is rendered last so `&mut app.art` is the final borrow.
+fn draw_now_playing_pane(
+    frame: &mut ratatui::Frame,
+    app: &mut App,
+    area: ratatui::layout::Rect,
+    art_cols: u16,
+    v: &view::RenderLines,
+) {
+    // A placeholder is shown even when art is absent/not yet fetched, to make the empty state
+    // explicit. `art_cols` (from `view::art_col_width`) is 0 when no column should be shown.
+    let (art_area, text_area) = if art_cols > 0 {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(art_cols), Constraint::Min(1)])
+            .split(area);
+        (Some(cols[0]), cols[1])
+    } else {
+        (None, area)
+    };
+
+    // Priority-ordered rows: highest first, so `stack_rows` drops device/album before title.
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let accent = Style::default()
         .fg(theme::GREEN)
         .add_modifier(Modifier::BOLD);
-    frame.render_widget(Paragraph::new(v.state).style(accent), rows[0]);
-    frame.render_widget(Paragraph::new(v.title).style(bold), rows[1]);
-    frame.render_widget(Paragraph::new(v.artist), rows[2]);
-    frame.render_widget(Paragraph::new(v.album), rows[3]);
-    frame.render_widget(
-        Gauge::default()
-            .ratio(v.ratio)
-            .label(v.progress_label)
-            .gauge_style(Style::default().fg(theme::GREEN))
-            .use_unicode(true),
-        rows[4],
-    );
-    frame.render_widget(Paragraph::new(v.device), rows[5]);
+    let plain = Style::default();
+    let lines = [
+        (v.state.as_str(), accent),
+        (v.title.as_str(), bold),
+        (v.artist.as_str(), plain),
+        (v.album.as_str(), plain),
+        (v.device.as_str(), plain),
+    ];
+    for ((text, style), rect) in lines.iter().zip(view::stack_rows(text_area, lines.len())) {
+        frame.render_widget(Paragraph::new(*text).style(*style), rect);
+    }
 
-    // Status line: if auto-refresh has stopped, always show the notice (drawn from poll_failures so
-    // it does not vanish with the status auto-clear). Otherwise, color by kind.
-    let (status_text, status_style) = if app.poll_failures >= MAX_POLL_FAILURES {
+    // Cover art last (first `&mut app.art` borrow). Placeholder makes the empty state explicit.
+    if let Some(art_rect) = art_area {
+        if let Some(art) = app.art.as_mut() {
+            frame.render_stateful_widget(StatefulImage::default(), art_rect, art);
+        } else {
+            let art_placeholder = Paragraph::new(format!("{}\n\n(no art)", theme::MUSIC))
+                .alignment(Alignment::Center)
+                .style(Style::default().add_modifier(Modifier::DIM))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(theme::GREEN)),
+                );
+            frame.render_widget(art_placeholder, art_rect);
+        }
+    }
+}
+
+/// Draw the always-present status line. If auto-refresh has stopped, always show the notice (drawn
+/// from `poll_failures` so it does not vanish with the status auto-clear); otherwise color by kind.
+fn draw_status_line(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
+    let (text, style) = if app.poll_failures >= MAX_POLL_FAILURES {
         (
             format!(
                 "{} auto-refresh is stopped. Press r to retry / q to quit",
@@ -1214,33 +1265,19 @@ fn draw_now(frame: &mut ratatui::Frame, app: &mut App) {
         };
         (app.status.clone(), style)
     };
-    frame.render_widget(Paragraph::new(status_text).style(status_style), rows[7]);
-    frame.render_widget(
-        Paragraph::new("? help   q quit")
-            .alignment(Alignment::Center)
-            .style(Style::default().add_modifier(Modifier::DIM)),
-        rows[8],
-    );
+    frame.render_widget(Paragraph::new(text).style(style), area);
+}
 
-    // Draw the cover art last (this is the first time `&mut app.art` is borrowed = all the immutable
-    // borrows of the text drawing above are done). The protocol shows a real image / half-blocks
-    // depending on the terminal. When art is absent (episode / no image / before fetch or on
-    // failure), a placeholder makes the empty state explicit.
-    if let Some(area) = art_area {
-        if let Some(art) = app.art.as_mut() {
-            frame.render_stateful_widget(StatefulImage::default(), area, art);
-        } else {
-            let placeholder = Paragraph::new(format!("{}\n\n(no art)", theme::MUSIC))
-                .alignment(Alignment::Center)
-                .style(Style::default().add_modifier(Modifier::DIM))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(theme::GREEN)),
-                );
-            frame.render_widget(placeholder, area);
-        }
-    }
+/// Draw the bottom playback bar (single source of progress). A graphical redesign is a later phase.
+fn draw_playbar(frame: &mut ratatui::Frame, ratio: f64, label: &str, area: ratatui::layout::Rect) {
+    frame.render_widget(
+        Gauge::default()
+            .ratio(ratio)
+            .label(label.to_owned())
+            .gauge_style(Style::default().fg(theme::GREEN))
+            .use_unicode(true),
+        area,
+    );
 }
 
 /// Library browse view (tabs + list).
