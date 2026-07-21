@@ -112,10 +112,10 @@ spotterm tui
 | `/` | search and play |
 | `tab` | move focus between the library and detail panes |
 | `[` / `]` | library: previous / next tab (All / Artists / Albums / Playlists / Tracks) |
-| `↑` / `↓` | library: move the selection |
-| `enter` | library: play the selection |
+| `↑` / `↓` | move the selection in the focused pane (library / detail) |
+| `enter` | play the selection (library item, or a track from the detail pane) |
 | `d` | device picker (transfer playback) |
-| `r` | refresh (playback, and the focused library tab) |
+| `r` | refresh (playback, and the focused library tab or detail pane) |
 | `?` | help |
 | `q` / `Esc` / `Ctrl-C` | quit |
 

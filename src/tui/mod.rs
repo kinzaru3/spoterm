@@ -9,9 +9,11 @@
 
 mod art;
 mod browse;
+mod detail;
 mod devices;
 mod view;
 
+use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 
@@ -56,6 +58,9 @@ const MAX_POLL_FAILURES: u32 = 3;
 const SEARCH_LIMIT: u32 = 10;
 /// How long a status line is shown before it is automatically cleared.
 const STATUS_TTL: Duration = Duration::from_secs(4);
+/// Cap on the per-item detail cache. Past this the cache is cleared wholesale (a simple bound that
+/// keeps memory flat over a long session; the current selection is re-fetched on demand anyway).
+const DETAIL_CACHE_MAX: usize = 64;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -179,6 +184,11 @@ struct App {
     /// Whether the initial library fetch has been attempted. Set once so a failed initial load does
     /// not re-fetch every tick (the user can still force a reload by switching tabs).
     library_loaded: bool,
+    /// The always-visible detail pane state (tracks of the currently selected library item).
+    detail: detail::DetailState,
+    /// Per-library-item detail cache keyed by URI, so returning to a previously viewed selection does
+    /// not re-fetch. Bounded by the number of library items browsed in a session.
+    detail_cache: HashMap<String, detail::DetailData>,
     /// Whether the current track is saved in the library (`None` if undetermined). Re-fetched only on track change.
     saved: Option<bool>,
     /// Whether the current track's saved state has been queried. Query once per track to avoid
@@ -234,6 +244,8 @@ async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify, picker: Pick
         browse_cache: browse::BrowseCache::default(),
         library: browse::LibraryState::default(),
         library_loaded: false,
+        detail: detail::DetailState::default(),
+        detail_cache: HashMap::new(),
         saved: None,
         saved_checked: false,
         // Impose a timeout (so a hang does not freeze the loop) and disable redirects
@@ -285,6 +297,10 @@ async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify, picker: Pick
         // multi-call `All` fetch. The fetch is concurrent (see `browse::fetch_all`), so this is one
         // round-trip, comparable to the playback poll above.
         ensure_library_loaded(&mut app).await;
+
+        // Load the detail for the current library selection (only when the selection changed; cached
+        // per item). Runs after the library load so there is a selection to describe.
+        ensure_detail_loaded(&mut app).await;
 
         // Wait for a key up to TICK (if none, redraw to advance progress).
         // On Windows it also fires on release, so handle presses only.
@@ -344,6 +360,11 @@ async fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
         KeyCode::Up if app.focus == view::Focus::Library => app.library.select_prev(),
         KeyCode::Down if app.focus == view::Focus::Library => app.library.select_next(),
         KeyCode::Enter if app.focus == view::Focus::Library => library_play(app).await,
+        // Detail pane navigation, active only while the detail pane holds focus. ↑↓ move the
+        // selection within the track list, Enter plays it (see `detail_play`).
+        KeyCode::Up if app.focus == view::Focus::Detail => app.detail.select_prev(),
+        KeyCode::Down if app.focus == view::Focus::Detail => app.detail.select_next(),
+        KeyCode::Enter if app.focus == view::Focus::Detail => detail_play(app).await,
         KeyCode::Char('d') => open_devices(app).await,
         KeyCode::Char('?') => app.mode = Mode::Help,
         KeyCode::Char(' ') => control_toggle(app).await,
@@ -365,6 +386,13 @@ async fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
             if app.focus == view::Focus::Library {
                 app.browse_cache.clear(app.library.tab);
                 load_library(app, app.library.tab).await;
+            } else if app.focus == view::Focus::Detail {
+                // Force the detail to re-fetch: drop its cache entry and clear the key so the next
+                // `ensure_detail_loaded` reloads the current selection (recovers from a failed load
+                // even when the selection cannot change, e.g. a single-item library).
+                if let Some(key) = app.detail.key.take() {
+                    app.detail_cache.remove(&key);
+                }
             }
         }
         _ => {}
@@ -955,6 +983,74 @@ async fn library_play(app: &mut App) {
     }
 }
 
+// ---- Detail pane ------------------------------------------------------------
+
+/// Load the detail for the current library selection, when it changed. Cached per library-item URI so
+/// scrolling back to a previously viewed item is free. Fetch failure and an empty track list are both
+/// surfaced (never silent). Runs each loop tick but returns early when the selection is unchanged.
+async fn ensure_detail_loaded(app: &mut App) {
+    // Clone the bits we need from the selected item, dropping the `app.library` borrow before the
+    // async fetch reaches for `app.client`.
+    let selected = app
+        .library
+        .selected_item()
+        .map(|it| (it.target.clone(), it.title.clone(), it.subtitle.clone()));
+    let Some((target, title, subtitle)) = selected else {
+        // Empty library or the selection is on a header: there is nothing to show a detail for.
+        if app.detail.key.is_some() || app.detail.message.is_none() {
+            app.detail.clear(Some("Nothing selected".to_string()));
+        }
+        return;
+    };
+    let key = target.uri().to_string();
+    if app.detail.key.as_deref() == Some(key.as_str()) {
+        return; // selection unchanged — keep the current detail (and its own selection)
+    }
+    if let Some(data) = app.detail_cache.get(&key).cloned() {
+        app.detail.set(key, data);
+        return;
+    }
+    let fallback = if subtitle.is_empty() {
+        title
+    } else {
+        format!("{title} — {subtitle}")
+    };
+    match detail::fetch(&app.client, &target, &fallback).await {
+        Ok(data) => {
+            // Bound the cache: clear it wholesale once it grows past the cap (keeps memory flat over
+            // a long session; re-fetches happen on demand).
+            if app.detail_cache.len() >= DETAIL_CACHE_MAX {
+                app.detail_cache.clear();
+            }
+            app.detail_cache.insert(key.clone(), data.clone());
+            app.detail.set(key, data);
+        }
+        Err(e) => {
+            app.detail.set_error(key, format!("failed to fetch: {e:#}"));
+            app.status = format!("{} failed to fetch details: {e:#}", theme::WARN);
+        }
+    }
+}
+
+/// Play the detail track list as a queue, starting at the selected row, so `next`/`prev` walk the
+/// list (the same all-URIs-queued invariant as search). Reports on the always-visible status line.
+async fn detail_play(app: &mut App) {
+    let uris: Vec<String> = app.detail.rows.iter().map(|r| r.uri.clone()).collect();
+    if uris.is_empty() {
+        return;
+    }
+    let selected = app.detail.selected;
+    match start_playback_queue(app, &uris, selected).await {
+        Ok(()) => {
+            app.status = format!("{} Playback started", theme::PLAY);
+            app.last_poll = None;
+        }
+        Err(e) => {
+            app.status = format!("{} playback failed: {e:#}", theme::WARN);
+        }
+    }
+}
+
 // ---- Device picker ----------------------------------------------------------
 
 /// Key handling for the device picker overlay. Updates the selection synchronously and runs the required async action.
@@ -1215,11 +1311,8 @@ fn draw_dashboard(frame: &mut ratatui::Frame, app: &mut App) {
         frame.render_widget(placeholder_pane("Visualizer", false), vis);
     }
     draw_library_pane(frame, app, areas.library, focus == view::Focus::Library);
-    if let Some(detail) = areas.detail {
-        frame.render_widget(
-            placeholder_pane("Details", focus == view::Focus::Detail),
-            detail,
-        );
+    if let Some(detail_area) = areas.detail {
+        draw_detail_pane(frame, app, detail_area, focus == view::Focus::Detail);
     }
 
     draw_status_line(frame, app, areas.status);
@@ -1415,6 +1508,90 @@ fn draw_library_pane(
             .add_modifier(Modifier::BOLD),
     );
     frame.render_stateful_widget(list, rows[2], &mut list_state);
+}
+
+/// Draw the always-visible detail pane (lower-right dashboard region): a bordered block with the
+/// context title, a hint/message line, and the track list for the currently selected library item.
+/// The currently-playing track (matched by URI against Now Playing) is prefixed with the play glyph;
+/// the list selection is the `▶ ` marker. Border highlighted (GREEN bold) while focused.
+fn draw_detail_pane(
+    frame: &mut ratatui::Frame,
+    app: &App,
+    area: ratatui::layout::Rect,
+    focused: bool,
+) {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let border_style = if focused {
+        Style::default()
+            .fg(theme::GREEN)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        dim
+    };
+    let title = if app.detail.title.is_empty() {
+        " Details ".to_string()
+    } else {
+        format!(" {} ", app.detail.title)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)]) // hint / list
+        .split(inner);
+
+    let hint = app.detail.message.clone().unwrap_or_else(|| {
+        if app.detail.key.is_none() {
+            // Nothing has resolved yet (before the first selection loads): show a loading note
+            // instead of a misleading "0 tracks".
+            "Loading…".to_string()
+        } else {
+            view::detail_hint(app.detail.rows.len())
+        }
+    });
+    frame.render_widget(Paragraph::new(hint).style(dim), rows[0]);
+
+    // The URI of the track playing now, so the detail list can mark it with the play glyph.
+    let current = app.now.as_ref().and_then(|n| n.track_uri.as_deref());
+    let width = inner.width as usize;
+    let items: Vec<ListItem> = app
+        .detail
+        .rows
+        .iter()
+        .map(|r| {
+            let is_current = current == Some(r.uri.as_str());
+            let text = view::detail_row(
+                r.track_no,
+                &r.title,
+                &r.artists,
+                r.duration_ms,
+                is_current,
+                width,
+            );
+            let item = ListItem::new(text);
+            // Bold the currently-playing row so the glyph is not the only cue.
+            if is_current { item.style(bold) } else { item }
+        })
+        .collect();
+    let mut list_state = ListState::default();
+    if !app.detail.rows.is_empty() {
+        list_state.select(Some(app.detail.selected));
+    }
+    let list = List::new(items).highlight_symbol("▶ ").highlight_style(
+        Style::default()
+            .fg(theme::GREEN)
+            .add_modifier(Modifier::BOLD),
+    );
+    frame.render_stateful_widget(list, rows[1], &mut list_state);
 }
 
 /// Device picker view (list + selection highlight).
