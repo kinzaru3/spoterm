@@ -43,7 +43,8 @@ pub enum DeviceAction {
     Reload,
 }
 
-/// Update the selection position in place and return the required action (same shape as `browse::key_action`).
+/// Update the selection position in place and return the required action (same 2-step borrow-avoiding
+/// shape the search/library key handlers use: sync state update here, async work in the caller).
 pub fn key_action(key: KeyEvent, state: &mut DevicePickerState) -> DeviceAction {
     match key.code {
         KeyCode::Esc => DeviceAction::Close,
