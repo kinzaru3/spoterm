@@ -8,6 +8,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 use crate::format::{display_width, format_ms, truncate};
 use crate::theme;
+use crate::tui::browse::BrowseTab;
 
 /// A snapshot of the playback status from the most recent poll. Using `fetched_at` as the base,
 /// progress between polls is interpolated locally to look smooth.
@@ -170,6 +171,27 @@ pub fn search_row(name: &str, artists: &str, width: usize) -> String {
     truncate(&text, width.saturating_sub(2))
 }
 
+/// The library pane tab header, e.g. `[All] Artists  Albums  Playlists  Tracks`. The current tab is
+/// wrapped in brackets so it reads as selected even without color. Pure and testable.
+pub fn library_tab_header(current: BrowseTab) -> String {
+    BrowseTab::ALL
+        .iter()
+        .map(|t| {
+            if *t == current {
+                format!("[{}]", t.label())
+            } else {
+                format!(" {} ", t.label())
+            }
+        })
+        .collect()
+}
+
+/// The library pane's supplementary line (the default hint when there is no `message`). `count` is
+/// the number of playable items (headers excluded).
+pub fn library_hint(count: usize) -> String {
+    format!("{count} items — ↑↓ select / [ ] tab / Enter play")
+}
+
 /// Pure function that formats one device row for the device picker.
 /// Active is shown with `● (active)`, inactive with `○`, and restricted is annotated.
 /// Truncates at a width reduced by the 2 columns of the selection marker `"▶ "`.
@@ -206,10 +228,12 @@ pub fn help_entries() -> &'static [(&'static str, &'static str)] {
         ("+ / -", "volume ±5"),
         ("s", "save / unsave the current track"),
         ("/", "search and play"),
-        ("tab", "focus panel"),
-        ("2", "browse library"),
+        ("tab", "focus panel (library / detail)"),
+        ("[ / ]", "library: previous / next tab"),
+        ("↑ / ↓", "library: move selection"),
+        ("enter", "library: play selection"),
         ("d", "select device"),
-        ("r", "refresh (resume auto-refresh)"),
+        ("r", "refresh (playback / focused library tab)"),
         ("?", "this help"),
         ("q / Esc", "quit"),
         ("Ctrl-C", "quit (from any screen)"),
@@ -845,6 +869,24 @@ mod tests {
     }
 
     #[test]
+    fn library_tab_header_brackets_current_only() {
+        let out = library_tab_header(BrowseTab::All);
+        assert!(out.contains("[All]"));
+        assert!(out.contains(" Artists "));
+        assert!(!out.contains("[Artists]"));
+        // Every tab label appears exactly once.
+        for tab in BrowseTab::ALL {
+            assert!(out.contains(tab.label()));
+        }
+    }
+
+    #[test]
+    fn library_hint_reports_item_count() {
+        assert!(library_hint(7).starts_with("7 items"));
+        assert!(library_hint(7).contains("[ ] tab"));
+    }
+
+    #[test]
     fn device_row_active_marks_and_notes() {
         let out = device_row("MacBook Pro", "Computer", Some(65), true, false, 80);
         assert!(out.starts_with("● MacBook Pro [Computer]"));
@@ -913,7 +955,9 @@ mod tests {
             "s",
             "/",
             "tab",
-            "2",
+            "[ / ]",
+            "↑ / ↓",
+            "enter",
             "d",
             "r",
             "?",

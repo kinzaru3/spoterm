@@ -33,7 +33,11 @@ pub fn build_client(cfg: &Config) -> Result<AuthCodePkceSpotify> {
             "user-library-read",
             // Needed to save/remove the current track (the TUI `s` action). After adding it,
             // log in again to grant the new scope.
-            "user-library-modify"
+            "user-library-modify",
+            // Needed to list the user's followed artists (the library "Artists" tab). Added in
+            // issue #26; existing tokens lack it, so users must run `spotterm login` again to grant
+            // it — until then the Artists tab reports a fetch error (never silently blank).
+            "user-follow-read"
         ),
         ..Default::default()
     };

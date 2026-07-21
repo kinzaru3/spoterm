@@ -59,11 +59,11 @@ const STATUS_TTL: Duration = Duration::from_secs(4);
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
-/// Screen mode. Normally Now Playing; `/` enters search, `2` library browse, `d` device selection.
+/// Screen mode. Normally the dashboard (Now Playing + always-visible library); `/` enters search,
+/// `d` device selection, `?` help. The library is no longer a modal — it lives in the dashboard.
 enum Mode {
     Normal,
     Search(SearchState),
-    Browse(browse::BrowseState),
     Devices(devices::DevicePickerState),
     /// Key-list help overlay (display only, no state).
     Help,
@@ -76,7 +76,6 @@ enum Mode {
 enum ModeKind {
     Normal,
     Search,
-    Browse,
     Devices,
     Help,
 }
@@ -86,7 +85,6 @@ impl Mode {
         match self {
             Mode::Normal => ModeKind::Normal,
             Mode::Search(_) => ModeKind::Search,
-            Mode::Browse(_) => ModeKind::Browse,
             Mode::Devices(_) => ModeKind::Devices,
             Mode::Help => ModeKind::Help,
         }
@@ -174,8 +172,13 @@ struct App {
     /// by the `tab` handler so focus navigation clamps to the panes actually on screen; updated by
     /// `draw_dashboard`. Starts `false` — the first draw sets it before any key can be handled.
     detail_visible: bool,
-    /// Per-tab fetch-result cache for library browse (avoids re-fetching on tab switch).
+    /// Per-tab fetch-result cache for the library pane (avoids re-fetching on tab switch).
     browse_cache: browse::BrowseCache,
+    /// The always-visible library pane state (current tab, rows, selection, message).
+    library: browse::LibraryState,
+    /// Whether the initial library fetch has been attempted. Set once so a failed initial load does
+    /// not re-fetch every tick (the user can still force a reload by switching tabs).
+    library_loaded: bool,
     /// Whether the current track is saved in the library (`None` if undetermined). Re-fetched only on track change.
     saved: Option<bool>,
     /// Whether the current track's saved state has been queried. Query once per track to avoid
@@ -229,6 +232,8 @@ async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify, picker: Pick
         focus: view::Focus::Library,
         detail_visible: false,
         browse_cache: browse::BrowseCache::default(),
+        library: browse::LibraryState::default(),
+        library_loaded: false,
         saved: None,
         saved_checked: false,
         // Impose a timeout (so a hang does not freeze the loop) and disable redirects
@@ -275,6 +280,12 @@ async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify, picker: Pick
 
         terminal.draw(|frame| draw(frame, &mut app))?;
 
+        // Load the library once, *after* the first frame is drawn, so the dashboard (with the
+        // "Loading…" library note) appears immediately instead of the whole UI blocking on the
+        // multi-call `All` fetch. The fetch is concurrent (see `browse::fetch_all`), so this is one
+        // round-trip, comparable to the playback poll above.
+        ensure_library_loaded(&mut app).await;
+
         // Wait for a key up to TICK (if none, redraw to advance progress).
         // On Windows it also fires on release, so handle presses only.
         if event::poll(TICK)?
@@ -299,10 +310,6 @@ async fn handle_key(key: KeyEvent, app: &mut App) -> bool {
             handle_search_key(key, app).await;
             false
         }
-        ModeKind::Browse => {
-            handle_browse_key(key, app).await;
-            false
-        }
         ModeKind::Devices => {
             handle_devices_key(key, app).await;
             false
@@ -325,7 +332,18 @@ async fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
         // clamps to the library when the detail pane was hidden in the last draw (narrow terminal),
         // so focus never drifts to an off-screen pane.
         KeyCode::Tab => app.focus = app.focus.next(app.detail_visible),
-        KeyCode::Char('2') => load_browse(app, browse::BrowseTab::Playlists).await,
+        // Library pane navigation, active only while the library pane holds focus so the same keys
+        // stay free for the (future) detail pane. `[`/`]` switch tabs, ↑↓ move the selection, Enter
+        // plays. Left/Right remain seek (see below); the library uses the bracket keys for tabs.
+        KeyCode::Char('[') if app.focus == view::Focus::Library => {
+            load_library(app, app.library.tab.prev()).await;
+        }
+        KeyCode::Char(']') if app.focus == view::Focus::Library => {
+            load_library(app, app.library.tab.next()).await;
+        }
+        KeyCode::Up if app.focus == view::Focus::Library => app.library.select_prev(),
+        KeyCode::Down if app.focus == view::Focus::Library => app.library.select_next(),
+        KeyCode::Enter if app.focus == view::Focus::Library => library_play(app).await,
         KeyCode::Char('d') => open_devices(app).await,
         KeyCode::Char('?') => app.mode = Mode::Help,
         KeyCode::Char(' ') => control_toggle(app).await,
@@ -338,10 +356,16 @@ async fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
         KeyCode::Char('s') => control_save(app).await,
         // Manual refresh: reset the failure counter and resume auto-refresh. Also clear art_url so
         // the cover art can be re-fetched (even a track whose art failed can be retried with `r` — no dead end).
+        // While the library pane holds focus, also discard its current tab's cache and re-fetch, so
+        // library changes (new saves, follows) are picked up without restarting the app.
         KeyCode::Char('r') => {
             app.poll_failures = 0;
             app.last_poll = None;
             app.art_url = None;
+            if app.focus == view::Focus::Library {
+                app.browse_cache.clear(app.library.tab);
+                load_library(app, app.library.tab).await;
+            }
         }
         _ => {}
     }
@@ -850,89 +874,83 @@ async fn control_save(app: &mut App) {
     }
 }
 
-// ---- Library browse ---------------------------------------------------------
+// ---- Library pane -----------------------------------------------------------
 
-/// Key handling for the browse overlay. Updates the selection synchronously and runs the required async action.
-async fn handle_browse_key(key: KeyEvent, app: &mut App) {
-    let action = {
-        let Mode::Browse(state) = &mut app.mode else {
-            return;
-        };
-        browse::key_action(key, state)
-    };
-    match action {
-        browse::BrowseAction::None => {}
-        browse::BrowseAction::Close => app.mode = Mode::Normal,
-        browse::BrowseAction::Switch(tab) => load_browse(app, tab).await,
-        browse::BrowseAction::Play => browse_play(app).await,
-        browse::BrowseAction::Reload => {
-            // Discard the current tab's cache and re-fetch (= user-driven reload).
-            let Mode::Browse(state) = &app.mode else {
-                return;
-            };
-            let tab = state.tab;
-            app.browse_cache.clear(tab);
-            load_browse(app, tab).await;
+/// Load the library once, after the first frame is drawn. Set the "attempted" flag before awaiting so
+/// a slow or failing initial fetch does not re-trigger every loop tick; switching tabs (or `r`) still
+/// forces a reload of an un-cached tab, so a failed startup is recoverable.
+async fn ensure_library_loaded(app: &mut App) {
+    if app.library_loaded {
+        return;
+    }
+    app.library_loaded = true;
+    let tab = app.library.tab;
+    load_library(app, tab).await;
+}
+
+/// Switch to `tab` and populate the library pane. Uses the per-tab cache when present (no network);
+/// otherwise fetches and caches. Fetch failure is never silent: it shows on the pane and the status
+/// line, and leaves the pane empty (switching tabs re-fetches, so it is not a dead end).
+async fn load_library(app: &mut App, tab: browse::BrowseTab) {
+    app.library.tab = tab;
+    // On a cache hit, reuse the stored note too — a persistent partial failure (e.g. Artists needs a
+    // re-login) keeps being reported every time the tab is shown, not just on the first load.
+    if let Some(loaded) = app.browse_cache.get(tab).cloned() {
+        let message = library_message(&loaded.rows, loaded.note, tab);
+        app.library.set_rows(loaded.rows, message);
+        return;
+    }
+    match browse::fetch(&app.client, tab).await {
+        Ok(loaded) => {
+            // Cache the whole load (rows + note); the clone is cheap for a few dozen small structs.
+            app.browse_cache.set(tab, loaded.clone());
+            let message = library_message(&loaded.rows, loaded.note, tab);
+            app.library.set_rows(loaded.rows, message);
+        }
+        Err(e) => {
+            // `{e:#}` shows anyhow's full cause chain (e.g. the 403 behind "failed to fetch followed
+            // artists"), so the message names the real cause — a missing scope, a timeout, etc. —
+            // instead of only the outermost context.
+            app.library
+                .set_rows(Vec::new(), Some(format!("failed to fetch: {e:#}")));
+            app.status = format!("{} failed to fetch the library: {e:#}", theme::WARN);
         }
     }
 }
 
-/// Show the given tab's list and enter browse mode (switch tabs if already browsing).
-/// If cached, do not hit the network; fetch and cache only when not cached. Failures are reported.
-async fn load_browse(app: &mut App, tab: browse::BrowseTab) {
-    // If cached, clone and show immediately (clone is cheap for a few dozen small structs).
-    let items = match app.browse_cache.get(tab).cloned() {
-        Some(items) => items,
-        None => {
-            match browse::fetch(&app.client, tab).await {
-                Ok(items) => {
-                    app.browse_cache.set(tab, items.clone());
-                    items
-                }
-                Err(e) => {
-                    // If browsing, stay on screen and show a message; if in the normal view, put it on the status line.
-                    if let Mode::Browse(state) = &mut app.mode {
-                        state.message = Some(format!("failed to fetch: {e}"));
-                    } else {
-                        app.status = format!("{} failed to fetch the library: {e}", theme::WARN);
-                    }
-                    return;
-                }
-            }
-        }
-    };
-    let message = items
-        .is_empty()
-        .then(|| format!("{} is empty", tab.label()));
-    app.mode = Mode::Browse(browse::BrowseState {
-        tab,
-        items,
-        selected: 0,
-        message,
-    });
+/// The pane message for a freshly loaded tab: the partial-failure note if any, else an "empty" notice
+/// when no playable rows loaded (so a 0-item tab is never silent), else `None` (the hint is shown).
+fn library_message(
+    rows: &[browse::LibraryRow],
+    note: Option<String>,
+    tab: browse::BrowseTab,
+) -> Option<String> {
+    if let Some(note) = note {
+        return Some(note);
+    }
+    if !rows.iter().any(browse::LibraryRow::is_selectable) {
+        return Some(format!("{} is empty", tab.label()));
+    }
+    None
 }
 
-/// Play the selected item. On success return to the normal view; on failure keep a message on the overlay.
-async fn browse_play(app: &mut App) {
-    let target = match &app.mode {
-        Mode::Browse(state) => state.items.get(state.selected).map(|it| it.target.clone()),
-        _ => None,
-    };
-    let Some(target) = target else {
+/// Play the currently selected library item. Both outcomes report on the always-visible status line
+/// (the library pane is not a modal, so its own message is left as the load-derived note/hint and is
+/// never overwritten by a transient play result that would then go stale). A header selection plays
+/// nothing (headers are never selectable, so this only happens on an empty list, already messaged).
+async fn library_play(app: &mut App) {
+    let Some(target) = app.library.selected_item().map(|it| it.target.clone()) else {
         return;
     };
     match browse::play(&app.client, &target).await {
         Ok(()) => {
             app.status = format!("{} Playback started", theme::PLAY);
             app.last_poll = None;
-            app.mode = Mode::Normal;
         }
         Err(e) => {
-            if let Mode::Browse(state) = &mut app.mode {
-                state.message = Some(format!("playback failed: {e}"));
-            } else {
-                app.status = format!("{} playback failed: {e}", theme::WARN);
-            }
+            // `{e:#}` surfaces anyhow's full cause chain, so playback failures name the real reason
+            // (no active device, parse error, etc.), not just the outermost context.
+            app.status = format!("{} playback failed: {e:#}", theme::WARN);
         }
     }
 }
@@ -1075,11 +1093,6 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 draw_search(frame, state);
             }
         }
-        ModeKind::Browse => {
-            if let Mode::Browse(state) = &app.mode {
-                draw_browse(frame, state);
-            }
-        }
         ModeKind::Devices => {
             if let Mode::Devices(state) = &app.mode {
                 draw_devices(frame, state);
@@ -1201,10 +1214,7 @@ fn draw_dashboard(frame: &mut ratatui::Frame, app: &mut App) {
     if let Some(vis) = areas.visualizer {
         frame.render_widget(placeholder_pane("Visualizer", false), vis);
     }
-    frame.render_widget(
-        placeholder_pane("Library", focus == view::Focus::Library),
-        areas.library,
-    );
+    draw_library_pane(frame, app, areas.library, focus == view::Focus::Library);
     if let Some(detail) = areas.detail {
         frame.render_widget(
             placeholder_pane("Details", focus == view::Focus::Detail),
@@ -1322,61 +1332,82 @@ fn draw_playbar(frame: &mut ratatui::Frame, ratio: f64, label: &str, area: ratat
     );
 }
 
-/// Library browse view (tabs + list).
-fn draw_browse(frame: &mut ratatui::Frame, state: &browse::BrowseState) {
-    let area = frame.area();
-    let outer = Block::default()
+/// Draw the always-visible library pane (lower-left dashboard region): a bordered block with a tab
+/// header, a hint/message line, and the selectable row list. `Header` rows are dimmed and skipped by
+/// selection; `Item` rows reuse the same `search_row` formatter. The border is highlighted (GREEN
+/// bold) while the pane holds focus, dimmed otherwise, matching the other lower panes.
+fn draw_library_pane(
+    frame: &mut ratatui::Frame,
+    app: &App,
+    area: ratatui::layout::Rect,
+    focused: bool,
+) {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let border_style = if focused {
+        Style::default()
+            .fg(theme::GREEN)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        dim
+    };
+    let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::GREEN))
-        .title(" spotterm — Library ");
-    let inner = outer.inner(area);
-    frame.render_widget(outer, area);
+        .border_style(border_style)
+        .title(" Library ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // tab header
-            Constraint::Length(1), // hint
+            Constraint::Length(1), // hint / message
             Constraint::Min(1),    // list
-            Constraint::Length(1), // footer
         ])
         .split(inner);
 
-    let bold = Style::default().add_modifier(Modifier::BOLD);
-    let dim = Style::default().add_modifier(Modifier::DIM);
+    frame.render_widget(
+        Paragraph::new(view::library_tab_header(app.library.tab)).style(bold),
+        rows[0],
+    );
 
-    // Tab header (wrap the current tab in [ ]).
-    let header = browse::BrowseTab::ALL
+    // Playable item count (headers excluded) drives the default hint; a message (loading / empty /
+    // error / partial-failure note) takes precedence so the pane is never silent.
+    let item_count = app
+        .library
+        .rows
         .iter()
-        .map(|t| {
-            if *t == state.tab {
-                format!("[{}]", t.label())
-            } else {
-                format!(" {} ", t.label())
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    frame.render_widget(Paragraph::new(header).style(bold), rows[0]);
-
-    let hint = state.message.clone().unwrap_or_else(|| {
-        format!(
-            "{} items — ↑↓ select / ←→ tab / Enter play / r refresh / Esc back",
-            state.items.len()
-        )
-    });
+        .filter(|r| r.is_selectable())
+        .count();
+    let hint = app
+        .library
+        .message
+        .clone()
+        .unwrap_or_else(|| view::library_hint(item_count));
     frame.render_widget(Paragraph::new(hint).style(dim), rows[1]);
 
-    // List (title — subtitle. Row formatting reuses the same pure function as search).
     let width = inner.width as usize;
-    let items: Vec<ListItem> = state
-        .items
+    let items: Vec<ListItem> = app
+        .library
+        .rows
         .iter()
-        .map(|it| ListItem::new(view::search_row(&it.title, &it.subtitle, width)))
+        .map(|row| match row {
+            browse::LibraryRow::Header(text) => {
+                ListItem::new(text.clone()).style(bold.add_modifier(Modifier::DIM))
+            }
+            browse::LibraryRow::Item(it) => {
+                ListItem::new(view::search_row(&it.title, &it.subtitle, width))
+            }
+        })
         .collect();
     let mut list_state = ListState::default();
-    if !state.items.is_empty() {
-        list_state.select(Some(state.selected));
+    // Only highlight when the selection is on a playable row (never on a header or an empty list).
+    if app.library.selected_item().is_some() {
+        list_state.select(Some(app.library.selected));
     }
     let list = List::new(items).highlight_symbol("▶ ").highlight_style(
         Style::default()
@@ -1384,13 +1415,6 @@ fn draw_browse(frame: &mut ratatui::Frame, state: &browse::BrowseState) {
             .add_modifier(Modifier::BOLD),
     );
     frame.render_stateful_widget(list, rows[2], &mut list_state);
-
-    frame.render_widget(
-        Paragraph::new("↑↓ select   ←→ tab   Enter play   r refresh   Esc back   Ctrl-C quit")
-            .alignment(Alignment::Center)
-            .style(dim),
-        rows[3],
-    );
 }
 
 /// Device picker view (list + selection highlight).
