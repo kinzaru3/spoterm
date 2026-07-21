@@ -6,6 +6,8 @@
 
 use anyhow::{Context, Result};
 use rspotify::AuthCodePkceSpotify;
+use rspotify::ClientError;
+use rspotify::http::HttpError;
 use rspotify::model::{
     AlbumId, ArtistId, Market, PlayableItem, PlaylistId, SimplifiedArtist, SimplifiedTrack, TrackId,
 };
@@ -14,6 +16,7 @@ use rspotify::prelude::*;
 use crate::auth;
 use crate::format::join_artists;
 use crate::tui::browse::PlayTarget;
+use crate::tui::view;
 
 /// Number of detail rows fetched (first page only).
 const DETAIL_LIMIT: u32 = 50;
@@ -129,7 +132,7 @@ pub async fn fetch(
             let page = spotify
                 .playlist_items_manual(id, None, None, Some(DETAIL_LIMIT), None)
                 .await
-                .context("failed to fetch playlist items")?;
+                .map_err(|e| fetch_err("playlist tracks", e))?;
             let truncated_total = truncated_total(page.total, page.items.len());
             let rows = page
                 .items
@@ -159,7 +162,7 @@ pub async fn fetch(
             let tracks = spotify
                 .artist_top_tracks(id, Some(Market::FromToken))
                 .await
-                .context("failed to fetch artist top tracks")?;
+                .map_err(|e| fetch_err("artist top tracks", e))?;
             // Top tracks is a fixed short list (no paging), so it is never truncated.
             let rows = tracks
                 .into_iter()
@@ -178,7 +181,7 @@ pub async fn fetch(
             let full = spotify
                 .track(id, None)
                 .await
-                .context("failed to fetch the track")?;
+                .map_err(|e| fetch_err("track", e))?;
             match full.album.id {
                 Some(album_id) => {
                     let (rows, truncated_total) = album_rows(spotify, album_id).await?;
@@ -208,6 +211,29 @@ pub async fn fetch(
     }
 }
 
+/// The HTTP status of a client error, when the failure was an HTTP response (rather than a transport
+/// or parse error). Used to distinguish Spotify's `403` content restrictions from real failures.
+fn http_status(err: &ClientError) -> Option<u16> {
+    match err {
+        ClientError::Http(http) => match http.as_ref() {
+            HttpError::StatusCode(resp) => Some(resp.status().as_u16()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Wrap a failed fetch with a concise, user-facing lead message (via [`view::detail_error_message`],
+/// which frames Spotify's `403` content restrictions as an expected limitation), keeping the original
+/// error as the cause. The caller renders the chain with `{e:#}`, so the friendly lead shows first and
+/// the underlying rspotify error is preserved for diagnosis — its `Display` is short (e.g. "http
+/// error: status code 403 Forbidden"), not the raw `Debug` dump. Non-mapped failures in `fetch` (token
+/// refresh, URI parse) keep their own context chain and are unaffected. `what` is the content label.
+fn fetch_err(what: &str, err: ClientError) -> anyhow::Error {
+    let msg = view::detail_error_message(http_status(&err), what);
+    anyhow::Error::new(err).context(msg)
+}
+
 /// `Some(total)` when the context has more tracks than the single page we fetched, so the caller can
 /// tell the user the list is only the first page; `None` when everything fits.
 fn truncated_total(total: u32, fetched: usize) -> Option<u32> {
@@ -223,7 +249,7 @@ async fn album_rows(
     let page = spotify
         .album_track_manual(album_id, None, Some(DETAIL_LIMIT), None)
         .await
-        .context("failed to fetch album tracks")?;
+        .map_err(|e| fetch_err("album tracks", e))?;
     let truncated = truncated_total(page.total, page.items.len());
     let rows = page.items.into_iter().filter_map(simplified_row).collect();
     Ok((rows, truncated))

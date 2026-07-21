@@ -1026,8 +1026,12 @@ async fn ensure_detail_loaded(app: &mut App) {
             app.detail.set(key, data);
         }
         Err(e) => {
-            app.detail.set_error(key, format!("failed to fetch: {e:#}"));
-            app.status = format!("{} failed to fetch details: {e:#}", theme::WARN);
+            // Surface the full cause chain (`{e:#}`): `detail::fetch_err` leads with a concise,
+            // user-facing message and keeps the underlying error for diagnosis; non-mapped failures
+            // (token refresh, URI parse) retain their own context. Non-silent in pane and status line.
+            let msg = format!("{e:#}");
+            app.detail.set_error(key, msg.clone());
+            app.status = format!("{} {msg}", theme::WARN);
         }
     }
 }

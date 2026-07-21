@@ -198,6 +198,21 @@ pub fn detail_hint(count: usize) -> String {
     format!("{count} tracks — ↑↓ select / Enter play")
 }
 
+/// Turn a failed detail fetch into a concise, non-alarming pane message. `what` is the content label
+/// ("artist top tracks", "playlist tracks", …) and `status` is the HTTP status when the failure was an
+/// HTTP response. `403` is the common case for content Spotify's Web API restricts for this app's
+/// access tier (artist top-tracks and other users' / editorial playlists have been restricted since
+/// late 2024) — surface it as an expected limitation, not a scary error, while still never staying
+/// silent. Pure (primitives in, `String` out) so the mapping is unit-tested without HTTP models.
+pub fn detail_error_message(status: Option<u16>, what: &str) -> String {
+    match status {
+        Some(403) => format!("{what} unavailable — restricted by Spotify Web API (403)"),
+        Some(404) => format!("{what} not found (404)"),
+        Some(code) => format!("failed to load {what} (HTTP {code})"),
+        None => format!("failed to load {what}"),
+    }
+}
+
 /// Format one detail-pane track row: `{▶ }{no} {title} — {artists}` on the left with the duration
 /// right-aligned to the pane width. The currently-playing track is prefixed with the play glyph
 /// (distinct from the list's `▶ ` selection marker). Truncates at a width reduced by the 2 columns of
@@ -953,6 +968,37 @@ mod tests {
     fn detail_hint_reports_track_count() {
         assert!(detail_hint(12).starts_with("12 tracks"));
         assert!(detail_hint(12).contains("Enter play"));
+    }
+
+    #[test]
+    fn detail_error_403_reads_as_restricted_not_failure() {
+        let msg = detail_error_message(Some(403), "artist top tracks");
+        assert!(msg.contains("artist top tracks"));
+        assert!(msg.contains("restricted"));
+        assert!(msg.contains("403"));
+        // Framed as a limitation, not a scary failure.
+        assert!(!msg.contains("failed"));
+    }
+
+    #[test]
+    fn detail_error_404_reports_not_found() {
+        assert_eq!(
+            detail_error_message(Some(404), "playlist tracks"),
+            "playlist tracks not found (404)"
+        );
+    }
+
+    #[test]
+    fn detail_error_other_status_shows_code() {
+        assert_eq!(
+            detail_error_message(Some(500), "album tracks"),
+            "failed to load album tracks (HTTP 500)"
+        );
+    }
+
+    #[test]
+    fn detail_error_no_status_is_generic() {
+        assert_eq!(detail_error_message(None, "track"), "failed to load track");
     }
 
     #[test]
