@@ -192,6 +192,62 @@ pub fn library_hint(count: usize) -> String {
     format!("{count} items — ↑↓ select / [ ] tab / Enter play")
 }
 
+/// The detail pane's supplementary line (the default hint when there is no `message`). `count` is the
+/// number of tracks shown.
+pub fn detail_hint(count: usize) -> String {
+    format!("{count} tracks — ↑↓ select / Enter play")
+}
+
+/// Turn a failed detail fetch into a concise, non-alarming pane message. `what` is the content label
+/// ("artist top tracks", "playlist tracks", …) and `status` is the HTTP status when the failure was an
+/// HTTP response. `403` is the common case for content Spotify's Web API restricts for this app's
+/// access tier (artist top-tracks and other users' / editorial playlists have been restricted since
+/// late 2024) — surface it as an expected limitation, not a scary error, while still never staying
+/// silent. Pure (primitives in, `String` out) so the mapping is unit-tested without HTTP models.
+pub fn detail_error_message(status: Option<u16>, what: &str) -> String {
+    match status {
+        Some(403) => format!("{what} unavailable — restricted by Spotify Web API (403)"),
+        Some(404) => format!("{what} not found (404)"),
+        Some(code) => format!("failed to load {what} (HTTP {code})"),
+        None => format!("failed to load {what}"),
+    }
+}
+
+/// Format one detail-pane track row: `{▶ }{no} {title} — {artists}` on the left with the duration
+/// right-aligned to the pane width. The currently-playing track is prefixed with the play glyph
+/// (distinct from the list's `▶ ` selection marker). Truncates at a width reduced by the 2 columns of
+/// the selection marker, and reserves room for the right-aligned duration so it is never clipped.
+/// Pure (primitives in, `String` out) so it is unit-tested without building API models.
+pub fn detail_row(
+    track_no: Option<u32>,
+    title: &str,
+    artists: &str,
+    duration_ms: u128,
+    is_current: bool,
+    width: usize,
+) -> String {
+    let marker = if is_current {
+        format!("{} ", theme::PLAY)
+    } else {
+        String::new()
+    };
+    let no = track_no.map(|n| format!("{n} ")).unwrap_or_default();
+    let body = if artists.is_empty() {
+        format!("{marker}{no}{title}")
+    } else {
+        format!("{marker}{no}{title} — {artists}")
+    };
+    let dur = format_ms(duration_ms);
+    // Reserve the 2 columns the list highlight symbol occupies, then keep the duration (plus a gap)
+    // pinned to the right by truncating the body and padding the middle.
+    let avail = width.saturating_sub(2);
+    let dur_w = display_width(&dur);
+    let body_max = avail.saturating_sub(dur_w + 1);
+    let body = truncate(&body, body_max);
+    let pad = avail.saturating_sub(display_width(&body) + dur_w);
+    format!("{body}{}{dur}", " ".repeat(pad))
+}
+
 /// Pure function that formats one device row for the device picker.
 /// Active is shown with `● (active)`, inactive with `○`, and restricted is annotated.
 /// Truncates at a width reduced by the 2 columns of the selection marker `"▶ "`.
@@ -230,10 +286,10 @@ pub fn help_entries() -> &'static [(&'static str, &'static str)] {
         ("/", "search and play"),
         ("tab", "focus panel (library / detail)"),
         ("[ / ]", "library: previous / next tab"),
-        ("↑ / ↓", "library: move selection"),
-        ("enter", "library: play selection"),
+        ("↑ / ↓", "library / detail: move selection"),
+        ("enter", "library / detail: play selection"),
         ("d", "select device"),
-        ("r", "refresh (playback / focused library tab)"),
+        ("r", "refresh (playback / focused library tab or detail)"),
         ("?", "this help"),
         ("q / Esc", "quit"),
         ("Ctrl-C", "quit (from any screen)"),
@@ -884,6 +940,65 @@ mod tests {
     fn library_hint_reports_item_count() {
         assert!(library_hint(7).starts_with("7 items"));
         assert!(library_hint(7).contains("[ ] tab"));
+    }
+
+    #[test]
+    fn detail_row_right_aligns_duration_and_numbers() {
+        let out = detail_row(Some(4), "Weird Fishes", "Radiohead", 318_000, false, 40);
+        assert!(out.contains("4 Weird Fishes — Radiohead"));
+        assert!(out.trim_end().ends_with("5:18"));
+        // Fits within the pane width minus the 2-column selection marker.
+        assert!(crate::format::display_width(&out) <= 38);
+    }
+
+    #[test]
+    fn detail_row_marks_current_track_with_play_glyph() {
+        let out = detail_row(Some(1), "15 Step", "Radiohead", 237_000, true, 40);
+        assert!(out.starts_with(theme::PLAY));
+    }
+
+    #[test]
+    fn detail_row_without_track_number_omits_it() {
+        let out = detail_row(None, "Song", "", 60_000, false, 30);
+        assert!(out.starts_with("Song"));
+        assert!(out.trim_end().ends_with("1:00"));
+    }
+
+    #[test]
+    fn detail_hint_reports_track_count() {
+        assert!(detail_hint(12).starts_with("12 tracks"));
+        assert!(detail_hint(12).contains("Enter play"));
+    }
+
+    #[test]
+    fn detail_error_403_reads_as_restricted_not_failure() {
+        let msg = detail_error_message(Some(403), "artist top tracks");
+        assert!(msg.contains("artist top tracks"));
+        assert!(msg.contains("restricted"));
+        assert!(msg.contains("403"));
+        // Framed as a limitation, not a scary failure.
+        assert!(!msg.contains("failed"));
+    }
+
+    #[test]
+    fn detail_error_404_reports_not_found() {
+        assert_eq!(
+            detail_error_message(Some(404), "playlist tracks"),
+            "playlist tracks not found (404)"
+        );
+    }
+
+    #[test]
+    fn detail_error_other_status_shows_code() {
+        assert_eq!(
+            detail_error_message(Some(500), "album tracks"),
+            "failed to load album tracks (HTTP 500)"
+        );
+    }
+
+    #[test]
+    fn detail_error_no_status_is_generic() {
+        assert_eq!(detail_error_message(None, "track"), "failed to load track");
     }
 
     #[test]

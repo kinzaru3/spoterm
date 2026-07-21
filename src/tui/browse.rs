@@ -79,6 +79,19 @@ pub enum PlayTarget {
     Artist(String),
 }
 
+impl PlayTarget {
+    /// The Spotify URI backing this target. Used as the detail pane's cache key so switching the
+    /// library selection back to a previously viewed item reuses its fetched detail.
+    pub fn uri(&self) -> &str {
+        match self {
+            PlayTarget::Track(u)
+            | PlayTarget::Playlist(u)
+            | PlayTarget::Album(u)
+            | PlayTarget::Artist(u) => u,
+        }
+    }
+}
+
 /// One playable entry in the library list.
 #[derive(Clone)]
 pub struct BrowseItem {
