@@ -9,6 +9,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use crate::format::{display_width, format_ms, truncate};
 use crate::theme;
 use crate::tui::browse::BrowseTab;
+use crate::tui::search::SearchTab;
 
 /// A snapshot of the playback status from the most recent poll. Using `fetched_at` as the base,
 /// progress between polls is interpolated locally to look smooth.
@@ -150,16 +151,6 @@ pub fn seek_target(current_ms: u128, duration_ms: u128, delta_ms: i64) -> u128 {
     }
 }
 
-/// The supplementary line of the search overlay (the default hint when there is no `message`).
-/// Varies by phase and result count.
-pub fn search_hint(is_input: bool, results_len: usize) -> String {
-    if is_input {
-        "Enter to search / Esc to go back".to_string()
-    } else {
-        format!("{results_len} results — ↑↓ select / Enter play / Esc edit query")
-    }
-}
-
 /// Format one search-result row (`name — artists`, truncated to the width). Selection highlighting
 /// is done by the caller. Truncates at a width reduced by the 2 columns of the selection marker `"▶ "`.
 pub fn search_row(name: &str, artists: &str, width: usize) -> String {
@@ -190,6 +181,27 @@ pub fn library_tab_header(current: BrowseTab) -> String {
 /// the number of playable items (headers excluded).
 pub fn library_hint(count: usize) -> String {
     format!("{count} items — ↑↓ select / [ ] tab / Enter play")
+}
+
+/// The search results pane tab header, e.g. `[Top] Songs  Artists  Albums`. Mirrors
+/// `library_tab_header`: the current category is bracketed so it reads as selected without color.
+pub fn search_tab_header(current: SearchTab) -> String {
+    SearchTab::ALL
+        .iter()
+        .map(|t| {
+            if *t == current {
+                format!("[{}]", t.label())
+            } else {
+                format!(" {} ", t.label())
+            }
+        })
+        .collect()
+}
+
+/// The search results pane's supplementary line (the default hint when there is no `message`).
+/// `count` is the number of playable items shown for the current category (headers excluded).
+pub fn search_results_hint(count: usize) -> String {
+    format!("{count} results — ↑↓ select / [ ] category / Enter play / Esc edit")
 }
 
 /// The detail pane's supplementary line (the default hint when there is no `message`). `count` is the
@@ -917,11 +929,14 @@ mod tests {
     }
 
     #[test]
-    fn search_hint_varies_by_phase() {
-        assert!(search_hint(true, 0).contains("Enter to search"));
-        let results = search_hint(false, 3);
-        assert!(results.starts_with("3 results"));
-        assert!(results.contains("Enter play"));
+    fn search_tab_header_brackets_current_only() {
+        let out = search_tab_header(SearchTab::Top);
+        assert!(out.contains("[Top]"));
+        assert!(out.contains(" Songs "));
+        assert!(!out.contains("[Songs]"));
+        for tab in SearchTab::ALL {
+            assert!(out.contains(tab.label()), "missing {}", tab.label());
+        }
     }
 
     #[test]

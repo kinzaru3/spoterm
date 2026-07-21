@@ -22,6 +22,8 @@ pub const MUSIC: &str = "\u{f001}"; // nf-fa-music
 pub const ARTIST: &str = "\u{f130}"; // nf-fa-microphone
 /// Compact disc — album line.
 pub const ALBUM: &str = "\u{f51f}"; // nf-fa-compact_disc
+/// Magnifier — the search input bar.
+pub const SEARCH: &str = "\u{f002}"; // nf-fa-search
 /// Speaker — device / volume line.
 pub const VOLUME: &str = "\u{f028}"; // nf-fa-volume_up
 
@@ -56,8 +58,8 @@ mod tests {
     #[test]
     fn icons_are_nonempty_and_distinct() {
         let all = [
-            MUSIC, ARTIST, ALBUM, VOLUME, WARN, PLAY, PAUSE, NEXT, PREV, SEEK, HEART, HEART_O,
-            CHECK,
+            MUSIC, ARTIST, ALBUM, SEARCH, VOLUME, WARN, PLAY, PAUSE, NEXT, PREV, SEEK, HEART,
+            HEART_O, CHECK,
         ];
         assert!(all.iter().all(|g| !g.is_empty()), "no icon may be empty");
         for (i, a) in all.iter().enumerate() {
