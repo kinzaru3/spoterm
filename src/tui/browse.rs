@@ -221,13 +221,13 @@ impl LibraryState {
     }
 }
 
-/// Index of the first selectable row, if any.
-fn first_selectable(rows: &[LibraryRow]) -> Option<usize> {
+/// Index of the first selectable row, if any. Shared with the search pane (same `LibraryRow` model).
+pub(crate) fn first_selectable(rows: &[LibraryRow]) -> Option<usize> {
     rows.iter().position(LibraryRow::is_selectable)
 }
 
 /// Index of the first selectable row strictly after `from`, if any.
-fn next_selectable(rows: &[LibraryRow], from: usize) -> Option<usize> {
+pub(crate) fn next_selectable(rows: &[LibraryRow], from: usize) -> Option<usize> {
     rows.iter()
         .enumerate()
         .skip(from + 1)
@@ -236,7 +236,7 @@ fn next_selectable(rows: &[LibraryRow], from: usize) -> Option<usize> {
 }
 
 /// Index of the last selectable row strictly before `from`, if any.
-fn prev_selectable(rows: &[LibraryRow], from: usize) -> Option<usize> {
+pub(crate) fn prev_selectable(rows: &[LibraryRow], from: usize) -> Option<usize> {
     rows.iter()
         .enumerate()
         .take(from)

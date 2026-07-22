@@ -11,6 +11,7 @@ mod art;
 mod browse;
 mod detail;
 mod devices;
+mod search;
 mod view;
 
 use std::collections::HashMap;
@@ -33,8 +34,7 @@ use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 use rspotify::AuthCodePkceSpotify;
 use rspotify::model::{
-    CurrentPlaybackContext, FullTrack, LibraryId, Offset, PlayableId, PlayableItem, SearchResult,
-    SearchType, TrackId,
+    CurrentPlaybackContext, LibraryId, Offset, PlayableId, PlayableItem, TrackId,
 };
 use rspotify::prelude::*;
 
@@ -54,8 +54,6 @@ const VOL_STEP: i16 = 5;
 const SEEK_STEP_MS: i64 = 5_000;
 /// Stop auto-refresh once consecutive poll failures reach this count (avoids infinite retries on an invalid token, etc.).
 const MAX_POLL_FAILURES: u32 = 3;
-/// Maximum number of results fetched when searching.
-const SEARCH_LIMIT: u32 = 10;
 /// How long a status line is shown before it is automatically cleared.
 const STATUS_TTL: Duration = Duration::from_secs(4);
 /// Cap on the per-item detail cache. Past this the cache is cleared wholesale (a simple bound that
@@ -68,7 +66,9 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 /// `d` device selection, `?` help. The library is no longer a modal — it lives in the dashboard.
 enum Mode {
     Normal,
-    Search(SearchState),
+    // Boxed: `SearchState` (query + classified results + highlight detail) is far larger than the
+    // other variants, so boxing keeps `Mode` small (clippy::large_enum_variant).
+    Search(Box<search::SearchState>),
     Devices(devices::DevicePickerState),
     /// Key-list help overlay (display only, no state).
     Help,
@@ -94,64 +94,6 @@ impl Mode {
             Mode::Help => ModeKind::Help,
         }
     }
-}
-
-/// State of the search overlay.
-struct SearchState {
-    /// The query being typed.
-    query: String,
-    /// Whether typing input or selecting a result.
-    phase: SearchPhase,
-    /// Search results (playable tracks only).
-    results: Vec<TrackHit>,
-    /// Selection position in the result list.
-    selected: usize,
-    /// Supplementary message (0 results, errors, etc.).
-    message: Option<String>,
-}
-
-impl SearchState {
-    fn new() -> Self {
-        Self {
-            query: String::new(),
-            phase: SearchPhase::Input,
-            results: Vec::new(),
-            selected: 0,
-            message: None,
-        }
-    }
-}
-
-/// Phase of the search overlay.
-#[derive(Clone, Copy, PartialEq)]
-enum SearchPhase {
-    /// Typing the query.
-    Input,
-    /// Selecting a result.
-    Results,
-}
-
-/// One track in the search results (holds the URI used to play it).
-struct TrackHit {
-    name: String,
-    artists: String,
-    uri: String,
-}
-
-/// Async actions the search key handler asks the main body to perform.
-enum SearchAction {
-    None,
-    /// Close the overlay and return to the normal view.
-    Close,
-    /// Run a search with the query.
-    Submit(String),
-    /// Play the results as a queue, starting at `selected`, so `next`/`prev` walk the hit list.
-    Play {
-        uris: Vec<String>,
-        selected: usize,
-    },
-    /// Go back from result selection to input (edit the query).
-    BackToInput,
 }
 
 /// State of the TUI app.
@@ -302,6 +244,9 @@ async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify, picker: Pick
         // per item). Runs after the library load so there is a selection to describe.
         ensure_detail_loaded(&mut app).await;
 
+        // In search mode, load the highlight detail for the selected result (same per-URI cache).
+        ensure_search_detail_loaded(&mut app).await;
+
         // Wait for a key up to TICK (if none, redraw to advance progress).
         // On Windows it also fires on release, so handle presses only.
         if event::poll(TICK)?
@@ -343,7 +288,7 @@ async fn handle_key(key: KeyEvent, app: &mut App) -> bool {
 async fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => return true,
-        KeyCode::Char('/') => app.mode = Mode::Search(SearchState::new()),
+        KeyCode::Char('/') => app.mode = Mode::Search(Box::default()),
         // Cycle keyboard focus between the two lower dashboard panes (library <-> detail). `next`
         // clamps to the library when the detail pane was hidden in the last draw (narrow terminal),
         // so focus never drifts to an off-screen pane.
@@ -400,34 +345,60 @@ async fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
     false
 }
 
-/// Key handling for the search overlay. Updates the query/selection synchronously and runs the required async action.
+/// The async action a search key press asks the main body to perform (computed while borrowing
+/// `app.mode`, then run after the borrow is dropped, since the async work re-borrows `app`).
+enum SearchAction {
+    None,
+    /// Close search and return to the dashboard.
+    Close,
+    /// Run a search with the query.
+    Submit(String),
+    /// Play the current selection (queue the songs list for a track, context-play otherwise).
+    Play,
+    /// Switch the category tab.
+    Tab(search::SearchTab),
+    /// Go back from results to editing the query.
+    BackToInput,
+}
+
+/// Key handling for the search dashboard. In the input phase, keys edit the query; in the results
+/// phase, `[`/`]` switch category tabs, `tab` toggles the results/detail focus, and ↑↓/Enter drive the
+/// focused pane. The synchronous state update happens under the borrow; the async action runs after.
 async fn handle_search_key(key: KeyEvent, app: &mut App) {
-    // First drop the borrow, then run the action (the async work re-borrows app).
+    // Whether the detail pane was on screen at the last draw — used to clamp focus toggling to the
+    // panes actually visible (mirrors the Normal-mode `tab` handling).
+    let detail_visible = app.detail_visible;
     let action = {
         let Mode::Search(state) = &mut app.mode else {
             return;
         };
-        search_key_action(key, state)
+        search_key_action(key, state, detail_visible)
     };
     match action {
         SearchAction::None => {}
         SearchAction::Close => app.mode = Mode::Normal,
         SearchAction::Submit(q) => run_search(app, &q).await,
-        SearchAction::Play { uris, selected } => play_selection(app, &uris, selected).await,
+        SearchAction::Play => search_play(app).await,
+        SearchAction::Tab(tab) => {
+            if let Mode::Search(state) = &mut app.mode {
+                state.set_tab(tab);
+            }
+        }
         SearchAction::BackToInput => {
             if let Mode::Search(state) = &mut app.mode {
-                // Going back to input means rebuilding the query. Discard the old results and selection.
-                state.phase = SearchPhase::Input;
-                state.results.clear();
-                state.selected = 0;
-                state.message = None;
+                state.back_to_input();
             }
         }
     }
 }
 
-/// Update the query/selection synchronously and return the required async action.
-fn search_key_action(key: KeyEvent, state: &mut SearchState) -> SearchAction {
+/// Update the query/selection/focus synchronously and return the async action to run.
+fn search_key_action(
+    key: KeyEvent,
+    state: &mut search::SearchState,
+    detail_visible: bool,
+) -> SearchAction {
+    use search::SearchPhase;
     match state.phase {
         SearchPhase::Input => match key.code {
             KeyCode::Esc => SearchAction::Close,
@@ -450,98 +421,101 @@ fn search_key_action(key: KeyEvent, state: &mut SearchState) -> SearchAction {
         },
         SearchPhase::Results => match key.code {
             KeyCode::Esc => SearchAction::BackToInput,
+            KeyCode::Tab => {
+                state.focus = state.focus.next(detail_visible);
+                SearchAction::None
+            }
+            KeyCode::Char('[') => SearchAction::Tab(state.tab.prev()),
+            KeyCode::Char(']') => SearchAction::Tab(state.tab.next()),
             KeyCode::Up => {
-                state.selected = state.selected.saturating_sub(1);
+                match state.focus.effective(detail_visible) {
+                    view::Focus::Library => state.select_prev(),
+                    view::Focus::Detail => state.detail.select_prev(),
+                }
                 SearchAction::None
             }
             KeyCode::Down => {
-                if state.selected + 1 < state.results.len() {
-                    state.selected += 1;
+                match state.focus.effective(detail_visible) {
+                    view::Focus::Library => state.select_next(),
+                    view::Focus::Detail => state.detail.select_next(),
                 }
                 SearchAction::None
             }
-            KeyCode::Enter => {
-                if state.results.is_empty() {
-                    SearchAction::None
-                } else {
-                    // Queue every hit so `next`/`prev` walk the result list, starting at the selection.
-                    let uris = state.results.iter().map(|h| h.uri.clone()).collect();
-                    SearchAction::Play {
-                        uris,
-                        selected: state.selected,
-                    }
-                }
-            }
+            KeyCode::Enter => SearchAction::Play,
             _ => SearchAction::None,
         },
     }
 }
 
-/// Search tracks by query and transition to the results phase. On failure, stay in the input phase and inform the user.
+/// Run the multi-type search and populate the results, staying in search either way. On failure the
+/// query is kept for editing and the reason is shown (status line and pane message; never silent).
 async fn run_search(app: &mut App, q: &str) {
-    match search_tracks(app, q).await {
-        Ok(hits) => {
-            let message = hits
-                .is_empty()
-                .then(|| format!("No track found matching \"{q}\""));
-            app.mode = Mode::Search(SearchState {
-                query: q.to_string(),
-                phase: SearchPhase::Results,
-                results: hits,
-                selected: 0,
-                message,
-            });
+    match search::fetch(&app.client, q).await {
+        Ok(results) => {
+            if let Mode::Search(state) = &mut app.mode {
+                state.set_results(q.to_string(), results);
+            }
         }
         Err(e) => {
-            app.status = format!("{} search failed: {e}", theme::WARN);
+            // `{e:#}` surfaces anyhow's full cause chain, so the real reason (auth, network, etc.) shows.
+            app.status = format!("{} search failed: {e:#}", theme::WARN);
             if let Mode::Search(state) = &mut app.mode {
-                state.phase = SearchPhase::Input;
-                state.message = Some(format!("search failed: {e}"));
+                state.message = Some(format!("search failed: {e:#}"));
             }
         }
     }
 }
 
-async fn search_tracks(app: &App, q: &str) -> Result<Vec<TrackHit>> {
-    auth::ensure_fresh_token(&app.client).await?;
-    let result = app
-        .client
-        .search(q, SearchType::Track, None, None, Some(SEARCH_LIMIT), None)
-        .await
-        .context("search failed")?;
-    let SearchResult::Tracks(page) = result else {
-        anyhow::bail!("unexpected search result format");
+/// What to play for the current search selection: a track queues the whole songs list (so `next`/
+/// `prev` walk every song hit, starting at the selection); an artist/album context-plays.
+enum SearchPlay {
+    Queue { uris: Vec<String>, selected: usize },
+    Context(browse::PlayTarget),
+}
+
+/// Play the current search selection. Reports on the always-visible status line (search shares the
+/// dashboard, which draws `app.status`). A header/empty selection plays nothing.
+async fn search_play(app: &mut App) {
+    // Build the play plan under the borrow, then drop it before the async playback re-borrows app.
+    let plan = {
+        let Mode::Search(state) = &app.mode else {
+            return;
+        };
+        let Some(item) = state.selected_item() else {
+            return;
+        };
+        // Match every variant explicitly (like `browse::play`) so a new `PlayTarget` surfaces as a
+        // compile error here rather than silently falling into context playback.
+        match &item.target {
+            browse::PlayTarget::Track(uri) => match state.results.song_index(uri) {
+                // Queue every song hit so `next`/`prev` walk the list, starting at the selection.
+                Some(selected) => SearchPlay::Queue {
+                    uris: state.results.song_uris(),
+                    selected,
+                },
+                // The selection is a track not in the song list (should not happen — rows are rebuilt
+                // from `results`). Queue just that track so the *correct* song plays, never the first.
+                None => SearchPlay::Queue {
+                    uris: vec![uri.clone()],
+                    selected: 0,
+                },
+            },
+            browse::PlayTarget::Playlist(_)
+            | browse::PlayTarget::Album(_)
+            | browse::PlayTarget::Artist(_) => SearchPlay::Context(item.target.clone()),
+        }
     };
-    Ok(page.items.into_iter().filter_map(track_to_hit).collect())
-}
-
-/// Map only playable tracks (those with a URI) into `TrackHit`. Local songs, etc. are excluded.
-fn track_to_hit(t: FullTrack) -> Option<TrackHit> {
-    let uri = t.id.as_ref()?.uri();
-    let artists: Vec<String> = t.artists.into_iter().map(|a| a.name).collect();
-    Some(TrackHit {
-        name: t.name,
-        artists: join_artists(&artists),
-        uri,
-    })
-}
-
-/// Play the search results as a queue, starting at `selected`. On success, return to the normal
-/// view; on failure, stay on the overlay and inform via a message (the search screen does not draw
-/// `app.status`, so use `state.message` here).
-async fn play_selection(app: &mut App, uris: &[String], selected: usize) {
-    match start_playback_queue(app, uris, selected).await {
+    let result = match plan {
+        SearchPlay::Queue { uris, selected } => start_playback_queue(app, &uris, selected).await,
+        SearchPlay::Context(target) => browse::play(&app.client, &target).await,
+    };
+    match result {
         Ok(()) => {
             app.status = format!("{} Playback started", theme::PLAY);
-            app.last_poll = None; // Reflect playback start on screen quickly
-            app.mode = Mode::Normal;
+            app.last_poll = None; // Reflect playback start on screen quickly.
         }
         Err(e) => {
-            if let Mode::Search(state) = &mut app.mode {
-                state.message = Some(format!("playback failed: {e}"));
-            } else {
-                app.status = format!("{} playback failed: {e}", theme::WARN);
-            }
+            app.status = format!("{} playback failed: {e:#}", theme::WARN);
         }
     }
 }
@@ -1055,6 +1029,79 @@ async fn detail_play(app: &mut App) {
     }
 }
 
+// ---- Search detail ----------------------------------------------------------
+
+/// Borrow the search state when the app is in search mode (`Box<SearchState>` derefs to the state).
+/// A small accessor so search handlers avoid repeating the `Mode::Search` destructure.
+fn search_state(app: &App) -> Option<&search::SearchState> {
+    match &app.mode {
+        Mode::Search(state) => Some(state),
+        _ => None,
+    }
+}
+
+/// Mutable counterpart of [`search_state`].
+fn search_state_mut(app: &mut App) -> Option<&mut search::SearchState> {
+    match &mut app.mode {
+        Mode::Search(state) => Some(state),
+        _ => None,
+    }
+}
+
+/// Load the highlight detail for the current search selection, when it changed. Mirrors
+/// [`ensure_detail_loaded`] but reads/writes the search state's own detail pane, and shares the same
+/// per-URI `detail_cache` so a result already viewed in the library (or vice versa) is free. Runs
+/// only while browsing results; a header/empty selection clears the pane (never silently blank).
+async fn ensure_search_detail_loaded(app: &mut App) {
+    let selected = match search_state(app) {
+        Some(state) if state.phase == search::SearchPhase::Results => state
+            .selected_item()
+            .map(|it| (it.target.clone(), it.title.clone(), it.subtitle.clone())),
+        _ => return,
+    };
+    let Some((target, title, subtitle)) = selected else {
+        if let Some(state) = search_state_mut(app)
+            && (state.detail.key.is_some() || state.detail.message.is_none())
+        {
+            state.detail.clear(Some("Nothing selected".to_string()));
+        }
+        return;
+    };
+    let key = target.uri().to_string();
+    if search_state(app).is_some_and(|s| s.detail.key.as_deref() == Some(key.as_str())) {
+        return; // selection unchanged — keep the current detail (and its own selection)
+    }
+    if let Some(data) = app.detail_cache.get(&key).cloned() {
+        if let Some(state) = search_state_mut(app) {
+            state.detail.set(key, data);
+        }
+        return;
+    }
+    let fallback = if subtitle.is_empty() {
+        title
+    } else {
+        format!("{title} — {subtitle}")
+    };
+    match detail::fetch(&app.client, &target, &fallback).await {
+        Ok(data) => {
+            if app.detail_cache.len() >= DETAIL_CACHE_MAX {
+                app.detail_cache.clear();
+            }
+            app.detail_cache.insert(key.clone(), data.clone());
+            if let Some(state) = search_state_mut(app) {
+                state.detail.set(key, data);
+            }
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            if let Some(state) = search_state_mut(app) {
+                state.detail.set_error(key, msg.clone());
+            }
+            app.status = format!("{} {msg}", theme::WARN);
+        }
+    }
+}
+
 // ---- Device picker ----------------------------------------------------------
 
 /// Key handling for the device picker overlay. Updates the selection synchronously and runs the required async action.
@@ -1187,12 +1234,9 @@ fn install_panic_hook() {
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     // Branch on ModeKind (Copy) to release the borrow immediately. Normal needs `&mut app` for image rendering.
     match app.mode.kind() {
-        ModeKind::Normal => draw_dashboard(frame, app),
-        ModeKind::Search => {
-            if let Mode::Search(state) = &app.mode {
-                draw_search(frame, state);
-            }
-        }
+        // Search shares the dashboard shell (Now Playing / playbar / footer); it only swaps the lower
+        // panes for the results/highlight and reveals the search bar. So both draw the dashboard.
+        ModeKind::Normal | ModeKind::Search => draw_dashboard(frame, app),
         ModeKind::Devices => {
             if let Mode::Devices(state) = &app.mode {
                 draw_devices(frame, state);
@@ -1286,8 +1330,14 @@ fn draw_dashboard(frame: &mut ratatui::Frame, app: &mut App) {
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
-    // Phase 1 draws the dashboard with search inactive (search still uses its own overlay view).
-    let areas = view::dashboard_areas(inner, false);
+    // Search mode reveals the search bar and swaps the lower panes; Normal hides the bar and shows
+    // the library. `search_focus` (when in search) selects the focused lower pane, replacing `app.focus`.
+    let search_focus = match &app.mode {
+        Mode::Search(state) => Some(state.focus),
+        _ => None,
+    };
+    let search_active = search_focus.is_some();
+    let areas = view::dashboard_areas(inner, search_active);
 
     // Reserve the cover-art column first (pure), then build the display lines against the *text*
     // width that actually remains. Passing the full pane width would make `truncate` think no
@@ -1310,13 +1360,26 @@ fn draw_dashboard(frame: &mut ratatui::Frame, app: &mut App) {
     // Record it so the `tab` key handler (which has no access to the frame size) can clamp focus
     // navigation to the panes actually on screen.
     app.detail_visible = detail_visible;
-    let focus = app.focus.effective(detail_visible);
+    // In search mode the focused pane comes from the search state; otherwise from `app.focus`.
+    let focus = search_focus.unwrap_or(app.focus).effective(detail_visible);
     if let Some(vis) = areas.visualizer {
         frame.render_widget(placeholder_pane("Visualizer", false), vis);
     }
-    draw_library_pane(frame, app, areas.library, focus == view::Focus::Library);
-    if let Some(detail_area) = areas.detail {
-        draw_detail_pane(frame, app, detail_area, focus == view::Focus::Detail);
+    // The search bar row is present only in search mode (pure splitter returns `Some` then).
+    if let Some(bar) = areas.search_bar {
+        draw_search_bar(frame, app, bar);
+    }
+    // Lower panes: search swaps in the results/highlight; Normal shows the library/detail.
+    if search_active {
+        draw_search_results_pane(frame, app, areas.library, focus == view::Focus::Library);
+        if let Some(detail_area) = areas.detail {
+            draw_search_detail_pane(frame, app, detail_area, focus == view::Focus::Detail);
+        }
+    } else {
+        draw_library_pane(frame, app, areas.library, focus == view::Focus::Library);
+        if let Some(detail_area) = areas.detail {
+            draw_detail_pane(frame, app, detail_area, focus == view::Focus::Detail);
+        }
     }
 
     draw_status_line(frame, app, areas.status);
@@ -1429,15 +1492,55 @@ fn draw_playbar(frame: &mut ratatui::Frame, ratio: f64, label: &str, area: ratat
     );
 }
 
-/// Draw the always-visible library pane (lower-left dashboard region): a bordered block with a tab
-/// header, a hint/message line, and the selectable row list. `Header` rows are dimmed and skipped by
-/// selection; `Item` rows reuse the same `search_row` formatter. The border is highlighted (GREEN
-/// bold) while the pane holds focus, dimmed otherwise, matching the other lower panes.
+/// Draw the always-visible library pane (lower-left dashboard region). Delegates to the shared
+/// tabbed-list renderer; a message (loading / empty / error / partial-failure note) takes precedence
+/// over the default item-count hint so the pane is never silent.
 fn draw_library_pane(
     frame: &mut ratatui::Frame,
     app: &App,
     area: ratatui::layout::Rect,
     focused: bool,
+) {
+    let item_count = app
+        .library
+        .rows
+        .iter()
+        .filter(|r| r.is_selectable())
+        .count();
+    let hint = app
+        .library
+        .message
+        .clone()
+        .unwrap_or_else(|| view::library_hint(item_count));
+    draw_tabbed_list_pane(
+        frame,
+        area,
+        focused,
+        " Library ",
+        view::library_tab_header(app.library.tab),
+        hint,
+        &app.library.rows,
+        app.library.selected,
+        app.library.selected_item().is_some(),
+    );
+}
+
+/// Shared renderer for the lower-left tabbed list pane (library and search results): a bordered block
+/// with a tab header, a hint/message line, and the selectable row list. `Header` rows are dimmed and
+/// skipped by selection; `Item` rows reuse the same `search_row` formatter. The border is highlighted
+/// (GREEN bold) while focused, dimmed otherwise, matching the other lower panes. `has_selection` gates
+/// the highlight so it never lands on a header or an empty list.
+#[allow(clippy::too_many_arguments)]
+fn draw_tabbed_list_pane(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    focused: bool,
+    title: &str,
+    tab_header: String,
+    hint: String,
+    rows_data: &[browse::LibraryRow],
+    selected: usize,
+    has_selection: bool,
 ) {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let bold = Style::default().add_modifier(Modifier::BOLD);
@@ -1451,7 +1554,7 @@ fn draw_library_pane(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
-        .title(" Library ");
+        .title(title.to_string());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 || inner.width == 0 {
@@ -1467,30 +1570,11 @@ fn draw_library_pane(
         ])
         .split(inner);
 
-    frame.render_widget(
-        Paragraph::new(view::library_tab_header(app.library.tab)).style(bold),
-        rows[0],
-    );
-
-    // Playable item count (headers excluded) drives the default hint; a message (loading / empty /
-    // error / partial-failure note) takes precedence so the pane is never silent.
-    let item_count = app
-        .library
-        .rows
-        .iter()
-        .filter(|r| r.is_selectable())
-        .count();
-    let hint = app
-        .library
-        .message
-        .clone()
-        .unwrap_or_else(|| view::library_hint(item_count));
+    frame.render_widget(Paragraph::new(tab_header).style(bold), rows[0]);
     frame.render_widget(Paragraph::new(hint).style(dim), rows[1]);
 
     let width = inner.width as usize;
-    let items: Vec<ListItem> = app
-        .library
-        .rows
+    let items: Vec<ListItem> = rows_data
         .iter()
         .map(|row| match row {
             browse::LibraryRow::Header(text) => {
@@ -1502,9 +1586,8 @@ fn draw_library_pane(
         })
         .collect();
     let mut list_state = ListState::default();
-    // Only highlight when the selection is on a playable row (never on a header or an empty list).
-    if app.library.selected_item().is_some() {
-        list_state.select(Some(app.library.selected));
+    if has_selection {
+        list_state.select(Some(selected));
     }
     let list = List::new(items).highlight_symbol("▶ ").highlight_style(
         Style::default()
@@ -1524,6 +1607,21 @@ fn draw_detail_pane(
     area: ratatui::layout::Rect,
     focused: bool,
 ) {
+    let current = app.now.as_ref().and_then(|n| n.track_uri.as_deref());
+    draw_detail_state(frame, area, focused, &app.detail, current);
+}
+
+/// Render a detail pane from any `DetailState` (shared by the library detail and the search
+/// highlight): a bordered block with the context title, a hint/message line, and the track list.
+/// `now_uri` is the currently-playing track's URI so its row is glyph-marked and bolded. The list
+/// selection is the `▶ ` marker; border highlighted (GREEN bold) while focused.
+fn draw_detail_state(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    focused: bool,
+    detail: &detail::DetailState,
+    now_uri: Option<&str>,
+) {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let border_style = if focused {
@@ -1533,10 +1631,10 @@ fn draw_detail_pane(
     } else {
         dim
     };
-    let title = if app.detail.title.is_empty() {
+    let title = if detail.title.is_empty() {
         " Details ".to_string()
     } else {
-        format!(" {} ", app.detail.title)
+        format!(" {} ", detail.title)
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1553,26 +1651,23 @@ fn draw_detail_pane(
         .constraints([Constraint::Length(1), Constraint::Min(1)]) // hint / list
         .split(inner);
 
-    let hint = app.detail.message.clone().unwrap_or_else(|| {
-        if app.detail.key.is_none() {
+    let hint = detail.message.clone().unwrap_or_else(|| {
+        if detail.key.is_none() {
             // Nothing has resolved yet (before the first selection loads): show a loading note
             // instead of a misleading "0 tracks".
             "Loading…".to_string()
         } else {
-            view::detail_hint(app.detail.rows.len())
+            view::detail_hint(detail.rows.len())
         }
     });
     frame.render_widget(Paragraph::new(hint).style(dim), rows[0]);
 
-    // The URI of the track playing now, so the detail list can mark it with the play glyph.
-    let current = app.now.as_ref().and_then(|n| n.track_uri.as_deref());
     let width = inner.width as usize;
-    let items: Vec<ListItem> = app
-        .detail
+    let items: Vec<ListItem> = detail
         .rows
         .iter()
         .map(|r| {
-            let is_current = current == Some(r.uri.as_str());
+            let is_current = now_uri == Some(r.uri.as_str());
             let text = view::detail_row(
                 r.track_no,
                 &r.title,
@@ -1587,8 +1682,8 @@ fn draw_detail_pane(
         })
         .collect();
     let mut list_state = ListState::default();
-    if !app.detail.rows.is_empty() {
-        list_state.select(Some(app.detail.selected));
+    if !detail.rows.is_empty() {
+        list_state.select(Some(detail.selected));
     }
     let list = List::new(items).highlight_symbol("▶ ").highlight_style(
         Style::default()
@@ -1596,6 +1691,69 @@ fn draw_detail_pane(
             .add_modifier(Modifier::BOLD),
     );
     frame.render_stateful_widget(list, rows[1], &mut list_state);
+}
+
+/// Draw the search input bar (the row revealed above the lower panes in search mode). Shows the query
+/// with a cursor while typing; in the results phase the cursor is hidden and a short hint is appended.
+fn draw_search_bar(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
+    let Mode::Search(state) = &app.mode else {
+        return;
+    };
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let cursor = if state.phase == search::SearchPhase::Input {
+        "▌"
+    } else {
+        ""
+    };
+    frame.render_widget(
+        Paragraph::new(format!("{} {}{}", theme::SEARCH, state.query, cursor)).style(bold),
+        area,
+    );
+}
+
+/// Draw the search results pane (lower-left in search mode). Delegates to the shared tabbed-list
+/// renderer with the category tabs and result rows; a message (no results / error) takes precedence
+/// over the default hint so the pane is never silent.
+fn draw_search_results_pane(
+    frame: &mut ratatui::Frame,
+    app: &App,
+    area: ratatui::layout::Rect,
+    focused: bool,
+) {
+    let Some(state) = search_state(app) else {
+        return;
+    };
+    let item_count = state.rows.iter().filter(|r| r.is_selectable()).count();
+    let hint = state
+        .message
+        .clone()
+        .unwrap_or_else(|| view::search_results_hint(item_count));
+    draw_tabbed_list_pane(
+        frame,
+        area,
+        focused,
+        " Search ",
+        view::search_tab_header(state.tab),
+        hint,
+        &state.rows,
+        state.selected,
+        state.selected_item().is_some(),
+    );
+}
+
+/// Draw the search highlight pane (lower-right in search mode): the track list for the selected
+/// result, via the shared [`draw_detail_state`].
+fn draw_search_detail_pane(
+    frame: &mut ratatui::Frame,
+    app: &App,
+    area: ratatui::layout::Rect,
+    focused: bool,
+) {
+    let Mode::Search(state) = &app.mode else {
+        return;
+    };
+    let current = app.now.as_ref().and_then(|n| n.track_uri.as_deref());
+    draw_detail_state(frame, area, focused, &state.detail, current);
 }
 
 /// Device picker view (list + selection highlight).
@@ -1659,72 +1817,6 @@ fn draw_devices(frame: &mut ratatui::Frame, state: &devices::DevicePickerState) 
             .alignment(Alignment::Center)
             .style(dim),
         rows[2],
-    );
-}
-
-/// Search overlay view (input field + result list).
-fn draw_search(frame: &mut ratatui::Frame, state: &SearchState) {
-    let area = frame.area();
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::GREEN))
-        .title(" spotterm — Search ");
-    let inner = outer.inner(area);
-    frame.render_widget(outer, area);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // input field
-            Constraint::Length(1), // hint
-            Constraint::Min(1),    // result list
-            Constraint::Length(1), // footer
-        ])
-        .split(inner);
-
-    let bold = Style::default().add_modifier(Modifier::BOLD);
-    let dim = Style::default().add_modifier(Modifier::DIM);
-
-    // Input field (show the cursor only in the input phase).
-    let cursor = if state.phase == SearchPhase::Input {
-        "▌"
-    } else {
-        ""
-    };
-    frame.render_widget(
-        Paragraph::new(format!("Search: {}{}", state.query, cursor)).style(bold),
-        rows[0],
-    );
-
-    // Hint line (message takes priority; otherwise a per-phase hint).
-    let hint = state.message.clone().unwrap_or_else(|| {
-        view::search_hint(state.phase == SearchPhase::Input, state.results.len())
-    });
-    frame.render_widget(Paragraph::new(hint).style(dim), rows[1]);
-
-    // Result list (highlight the selection position).
-    let width = inner.width as usize;
-    let items: Vec<ListItem> = state
-        .results
-        .iter()
-        .map(|h| ListItem::new(view::search_row(&h.name, &h.artists, width)))
-        .collect();
-    let mut list_state = ListState::default();
-    if !state.results.is_empty() {
-        list_state.select(Some(state.selected));
-    }
-    let list = List::new(items).highlight_symbol("▶ ").highlight_style(
-        Style::default()
-            .fg(theme::GREEN)
-            .add_modifier(Modifier::BOLD),
-    );
-    frame.render_stateful_widget(list, rows[2], &mut list_state);
-
-    frame.render_widget(
-        Paragraph::new("type → Enter search   ↑↓ select   Enter play   Esc back   Ctrl-C quit")
-            .alignment(Alignment::Center)
-            .style(dim),
-        rows[3],
     );
 }
 
