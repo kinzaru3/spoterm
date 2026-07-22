@@ -1,7 +1,9 @@
 //! Detail pane data model (issue #26 Phase 4). Drives the lower-right dashboard pane: given the
 //! library item currently selected, fetch the tracks that belong to it (album tracks / playlist
 //! items / artist top tracks / the track's own album) and expose them as flat, playable rows. It does
-//! not touch `App`; rendering lives in `mod.rs`, row formatting in `view.rs`. Loaders stay thin —
+//! owns the Detail pane's `App`-facing wiring too: loading/caching (`ensure_detail_loaded`),
+//! playback (`detail_play`), and rendering (`draw_detail_pane` / `draw_detail_state`, the latter also
+//! reused by the search highlight). Row formatting lives in `view.rs`; loaders stay thin —
 //! they map API models to primitives and hand off to the pure formatter, like `browse.rs`.
 
 use anyhow::{Context, Result};
@@ -13,10 +15,17 @@ use rspotify::model::{
 };
 use rspotify::prelude::*;
 
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Modifier, Style};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+
 use crate::auth;
 use crate::format::join_artists;
+use crate::theme;
 use crate::tui::browse::PlayTarget;
 use crate::tui::view;
+
+use super::App;
 
 /// Number of detail rows fetched (first page only).
 const DETAIL_LIMIT: u32 = 50;
@@ -287,6 +296,174 @@ fn track_row(
         duration_ms: duration.num_milliseconds().max(0) as u128,
         uri,
     })
+}
+
+// ---- Detail pane (App-facing action + rendering) ----------------------------
+
+/// Load the detail for the current library selection, when it changed. Cached per library-item URI so
+/// scrolling back to a previously viewed item is free. Fetch failure and an empty track list are both
+/// surfaced (never silent). Runs each loop tick but returns early when the selection is unchanged.
+pub(super) async fn ensure_detail_loaded(app: &mut App) {
+    // Clone the bits we need from the selected item, dropping the `app.library` borrow before the
+    // async fetch reaches for `app.client`.
+    let selected = app
+        .library
+        .selected_item()
+        .map(|it| (it.target.clone(), it.title.clone(), it.subtitle.clone()));
+    let Some((target, title, subtitle)) = selected else {
+        // Empty library or the selection is on a header: there is nothing to show a detail for.
+        if app.detail.key.is_some() || app.detail.message.is_none() {
+            app.detail.clear(Some("Nothing selected".to_string()));
+        }
+        return;
+    };
+    let key = target.uri().to_string();
+    if app.detail.key.as_deref() == Some(key.as_str()) {
+        return; // selection unchanged — keep the current detail (and its own selection)
+    }
+    if let Some(data) = app.detail_cache.get(&key).cloned() {
+        app.detail.set(key, data);
+        return;
+    }
+    let fallback = if subtitle.is_empty() {
+        title
+    } else {
+        format!("{title} — {subtitle}")
+    };
+    match fetch(&app.client, &target, &fallback).await {
+        Ok(data) => {
+            // Bound the cache: clear it wholesale once it grows past the cap (keeps memory flat over
+            // a long session; re-fetches happen on demand).
+            if app.detail_cache.len() >= super::DETAIL_CACHE_MAX {
+                app.detail_cache.clear();
+            }
+            app.detail_cache.insert(key.clone(), data.clone());
+            app.detail.set(key, data);
+        }
+        Err(e) => {
+            // Surface the full cause chain (`{e:#}`): `detail::fetch_err` leads with a concise,
+            // user-facing message and keeps the underlying error for diagnosis; non-mapped failures
+            // (token refresh, URI parse) retain their own context. Non-silent in pane and status line.
+            let msg = format!("{e:#}");
+            app.detail.set_error(key, msg.clone());
+            app.status = format!("{} {msg}", theme::WARN);
+        }
+    }
+}
+
+/// Play the detail track list as a queue, starting at the selected row, so `next`/`prev` walk the
+/// list (the same all-URIs-queued invariant as search). Reports on the always-visible status line.
+pub(super) async fn detail_play(app: &mut App) {
+    let uris: Vec<String> = app.detail.rows.iter().map(|r| r.uri.clone()).collect();
+    if uris.is_empty() {
+        return;
+    }
+    let selected = app.detail.selected;
+    match super::playback::start_playback_queue(app, &uris, selected).await {
+        Ok(()) => {
+            app.status = format!("{} Playback started", theme::PLAY);
+            app.last_poll = None;
+        }
+        Err(e) => {
+            app.status = format!("{} playback failed: {e:#}", theme::WARN);
+        }
+    }
+}
+
+/// Draw the always-visible detail pane (lower-right dashboard region): a bordered block with the
+/// context title, a hint/message line, and the track list for the currently selected library item.
+/// The currently-playing track (matched by URI against Now Playing) is prefixed with the play glyph;
+/// the list selection is the `▶ ` marker. Border highlighted (GREEN bold) while focused.
+pub(super) fn draw_detail_pane(
+    frame: &mut ratatui::Frame,
+    app: &App,
+    area: ratatui::layout::Rect,
+    focused: bool,
+) {
+    let current = app.now.as_ref().and_then(|n| n.track_uri.as_deref());
+    draw_detail_state(frame, area, focused, &app.detail, current);
+}
+
+/// Render a detail pane from any `DetailState` (shared by the library detail and the search
+/// highlight): a bordered block with the context title, a hint/message line, and the track list.
+/// `now_uri` is the currently-playing track's URI so its row is glyph-marked and bolded. The list
+/// selection is the `▶ ` marker; border highlighted (GREEN bold) while focused.
+pub(super) fn draw_detail_state(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    focused: bool,
+    detail: &DetailState,
+    now_uri: Option<&str>,
+) {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let border_style = if focused {
+        Style::default()
+            .fg(theme::GREEN)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        dim
+    };
+    let title = if detail.title.is_empty() {
+        " Details ".to_string()
+    } else {
+        format!(" {} ", detail.title)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)]) // hint / list
+        .split(inner);
+
+    let hint = detail.message.clone().unwrap_or_else(|| {
+        if detail.key.is_none() {
+            // Nothing has resolved yet (before the first selection loads): show a loading note
+            // instead of a misleading "0 tracks".
+            "Loading…".to_string()
+        } else {
+            view::detail_hint(detail.rows.len())
+        }
+    });
+    frame.render_widget(Paragraph::new(hint).style(dim), rows[0]);
+
+    let width = inner.width as usize;
+    let items: Vec<ListItem> = detail
+        .rows
+        .iter()
+        .map(|r| {
+            let is_current = now_uri == Some(r.uri.as_str());
+            let text = view::detail_row(
+                r.track_no,
+                &r.title,
+                &r.artists,
+                r.duration_ms,
+                is_current,
+                width,
+            );
+            let item = ListItem::new(text);
+            // Bold the currently-playing row so the glyph is not the only cue.
+            if is_current { item.style(bold) } else { item }
+        })
+        .collect();
+    let mut list_state = ListState::default();
+    if !detail.rows.is_empty() {
+        list_state.select(Some(detail.selected));
+    }
+    let list = List::new(items).highlight_symbol("▶ ").highlight_style(
+        Style::default()
+            .fg(theme::GREEN)
+            .add_modifier(Modifier::BOLD),
+    );
+    frame.render_stateful_widget(list, rows[1], &mut list_state);
 }
 
 #[cfg(test)]

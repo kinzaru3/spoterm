@@ -2,6 +2,11 @@
 //! library pane: per-tab data fetching, playback, and selection logic. It does not touch `App`;
 //! rendering and key wiring live in `mod.rs`, row formatting in `view.rs`. Replaces the former
 //! browse *overlay* — the library is now a first-class dashboard pane rather than a modal.
+//!
+//! Beyond the data model, this module owns the Library pane's `App`-facing wiring: loading/caching
+//! (`ensure_library_loaded` / `load_library`), playback (`library_play`), and rendering
+//! (`draw_library_pane`). Row formatting stays in `view.rs`; the dashboard shell in `mod.rs` only
+//! routes into it and supplies the shared `draw_tabbed_list_pane` renderer.
 
 use anyhow::{Context, Result};
 use rspotify::AuthCodePkceSpotify;
@@ -10,6 +15,10 @@ use rspotify::prelude::*;
 
 use crate::auth;
 use crate::format::join_artists;
+use crate::theme;
+use crate::tui::view;
+
+use super::App;
 
 /// Number of playlists fetched (API max 50, first page only).
 const PLAYLIST_LIMIT: u32 = 50;
@@ -421,6 +430,116 @@ pub async fn play(spotify: &AuthCodePkceSpotify, target: &PlayTarget) -> Result<
     };
     result.context("failed to start playback (an active device may be required)")?;
     Ok(())
+}
+
+// ---- Library pane (App-facing action + rendering) ---------------------------
+
+/// Load the library once, after the first frame is drawn. Set the "attempted" flag before awaiting so
+/// a slow or failing initial fetch does not re-trigger every loop tick; switching tabs (or `r`) still
+/// forces a reload of an un-cached tab, so a failed startup is recoverable.
+pub(super) async fn ensure_library_loaded(app: &mut App) {
+    if app.library_loaded {
+        return;
+    }
+    app.library_loaded = true;
+    let tab = app.library.tab;
+    load_library(app, tab).await;
+}
+
+/// Switch to `tab` and populate the library pane. Uses the per-tab cache when present (no network);
+/// otherwise fetches and caches. Fetch failure is never silent: it shows on the pane and the status
+/// line, and leaves the pane empty (switching tabs re-fetches, so it is not a dead end).
+pub(super) async fn load_library(app: &mut App, tab: BrowseTab) {
+    app.library.tab = tab;
+    // On a cache hit, reuse the stored note too — a persistent partial failure (e.g. Artists needs a
+    // re-login) keeps being reported every time the tab is shown, not just on the first load.
+    if let Some(loaded) = app.browse_cache.get(tab).cloned() {
+        let message = library_message(&loaded.rows, loaded.note, tab);
+        app.library.set_rows(loaded.rows, message);
+        return;
+    }
+    match fetch(&app.client, tab).await {
+        Ok(loaded) => {
+            // Cache the whole load (rows + note); the clone is cheap for a few dozen small structs.
+            app.browse_cache.set(tab, loaded.clone());
+            let message = library_message(&loaded.rows, loaded.note, tab);
+            app.library.set_rows(loaded.rows, message);
+        }
+        Err(e) => {
+            // `{e:#}` shows anyhow's full cause chain (e.g. the 403 behind "failed to fetch followed
+            // artists"), so the message names the real cause — a missing scope, a timeout, etc. —
+            // instead of only the outermost context.
+            app.library
+                .set_rows(Vec::new(), Some(format!("failed to fetch: {e:#}")));
+            app.status = format!("{} failed to fetch the library: {e:#}", theme::WARN);
+        }
+    }
+}
+
+/// The pane message for a freshly loaded tab: the partial-failure note if any, else an "empty" notice
+/// when no playable rows loaded (so a 0-item tab is never silent), else `None` (the hint is shown).
+fn library_message(rows: &[LibraryRow], note: Option<String>, tab: BrowseTab) -> Option<String> {
+    if let Some(note) = note {
+        return Some(note);
+    }
+    if !rows.iter().any(LibraryRow::is_selectable) {
+        return Some(format!("{} is empty", tab.label()));
+    }
+    None
+}
+
+/// Play the currently selected library item. Both outcomes report on the always-visible status line
+/// (the library pane is not a modal, so its own message is left as the load-derived note/hint and is
+/// never overwritten by a transient play result that would then go stale). A header selection plays
+/// nothing (headers are never selectable, so this only happens on an empty list, already messaged).
+pub(super) async fn library_play(app: &mut App) {
+    let Some(target) = app.library.selected_item().map(|it| it.target.clone()) else {
+        return;
+    };
+    match play(&app.client, &target).await {
+        Ok(()) => {
+            app.status = format!("{} Playback started", theme::PLAY);
+            app.last_poll = None;
+        }
+        Err(e) => {
+            // `{e:#}` surfaces anyhow's full cause chain, so playback failures name the real reason
+            // (no active device, parse error, etc.), not just the outermost context.
+            app.status = format!("{} playback failed: {e:#}", theme::WARN);
+        }
+    }
+}
+
+/// Draw the always-visible library pane (lower-left dashboard region). Delegates to the shared
+/// tabbed-list renderer; a message (loading / empty / error / partial-failure note) takes precedence
+/// over the default item-count hint so the pane is never silent.
+pub(super) fn draw_library_pane(
+    frame: &mut ratatui::Frame,
+    app: &App,
+    area: ratatui::layout::Rect,
+    focused: bool,
+) {
+    let item_count = app
+        .library
+        .rows
+        .iter()
+        .filter(|r| r.is_selectable())
+        .count();
+    let hint = app
+        .library
+        .message
+        .clone()
+        .unwrap_or_else(|| view::library_hint(item_count));
+    super::draw_tabbed_list_pane(
+        frame,
+        area,
+        focused,
+        " Library ",
+        view::library_tab_header(app.library.tab),
+        hint,
+        &app.library.rows,
+        app.library.selected,
+        app.library.selected_item().is_some(),
+    );
 }
 
 #[cfg(test)]

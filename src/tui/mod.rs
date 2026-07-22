@@ -11,6 +11,7 @@ mod art;
 mod browse;
 mod detail;
 mod devices;
+mod playback;
 mod search;
 mod view;
 
@@ -29,18 +30,12 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph};
-use ratatui_image::StatefulImage;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 use rspotify::AuthCodePkceSpotify;
-use rspotify::model::{
-    CurrentPlaybackContext, LibraryId, Offset, PlayableId, PlayableItem, TrackId,
-};
-use rspotify::prelude::*;
 
 use crate::auth;
 use crate::config::Config;
-use crate::format::join_artists;
 use crate::theme;
 use view::NowPlaying;
 
@@ -213,7 +208,7 @@ async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify, picker: Pick
         let forced = app.last_poll.is_none();
         let timer_due = app.last_poll.is_none_or(|t| t.elapsed() >= POLL_INTERVAL);
         if forced || (timer_due && app.poll_failures < MAX_POLL_FAILURES) {
-            poll_playback(&mut app).await;
+            playback::poll_playback(&mut app).await;
             app.last_poll = Some(Instant::now());
         }
 
@@ -238,14 +233,14 @@ async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify, picker: Pick
         // "Loading…" library note) appears immediately instead of the whole UI blocking on the
         // multi-call `All` fetch. The fetch is concurrent (see `browse::fetch_all`), so this is one
         // round-trip, comparable to the playback poll above.
-        ensure_library_loaded(&mut app).await;
+        browse::ensure_library_loaded(&mut app).await;
 
         // Load the detail for the current library selection (only when the selection changed; cached
         // per item). Runs after the library load so there is a selection to describe.
-        ensure_detail_loaded(&mut app).await;
+        detail::ensure_detail_loaded(&mut app).await;
 
         // In search mode, load the highlight detail for the selected result (same per-URI cache).
-        ensure_search_detail_loaded(&mut app).await;
+        search::ensure_search_detail_loaded(&mut app).await;
 
         // Wait for a key up to TICK (if none, redraw to advance progress).
         // On Windows it also fires on release, so handle presses only.
@@ -268,11 +263,11 @@ async fn handle_key(key: KeyEvent, app: &mut App) -> bool {
     }
     match app.mode.kind() {
         ModeKind::Search => {
-            handle_search_key(key, app).await;
+            search::handle_search_key(key, app).await;
             false
         }
         ModeKind::Devices => {
-            handle_devices_key(key, app).await;
+            devices::handle_devices_key(key, app).await;
             false
         }
         ModeKind::Help => {
@@ -297,29 +292,29 @@ async fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
         // stay free for the (future) detail pane. `[`/`]` switch tabs, ↑↓ move the selection, Enter
         // plays. Left/Right remain seek (see below); the library uses the bracket keys for tabs.
         KeyCode::Char('[') if app.focus == view::Focus::Library => {
-            load_library(app, app.library.tab.prev()).await;
+            browse::load_library(app, app.library.tab.prev()).await;
         }
         KeyCode::Char(']') if app.focus == view::Focus::Library => {
-            load_library(app, app.library.tab.next()).await;
+            browse::load_library(app, app.library.tab.next()).await;
         }
         KeyCode::Up if app.focus == view::Focus::Library => app.library.select_prev(),
         KeyCode::Down if app.focus == view::Focus::Library => app.library.select_next(),
-        KeyCode::Enter if app.focus == view::Focus::Library => library_play(app).await,
+        KeyCode::Enter if app.focus == view::Focus::Library => browse::library_play(app).await,
         // Detail pane navigation, active only while the detail pane holds focus. ↑↓ move the
         // selection within the track list, Enter plays it (see `detail_play`).
         KeyCode::Up if app.focus == view::Focus::Detail => app.detail.select_prev(),
         KeyCode::Down if app.focus == view::Focus::Detail => app.detail.select_next(),
-        KeyCode::Enter if app.focus == view::Focus::Detail => detail_play(app).await,
-        KeyCode::Char('d') => open_devices(app).await,
+        KeyCode::Enter if app.focus == view::Focus::Detail => detail::detail_play(app).await,
+        KeyCode::Char('d') => devices::open_devices(app).await,
         KeyCode::Char('?') => app.mode = Mode::Help,
-        KeyCode::Char(' ') => control_toggle(app).await,
-        KeyCode::Char('n') => control_next(app).await,
-        KeyCode::Char('p') => control_prev(app).await,
-        KeyCode::Char('+') | KeyCode::Char('=') => control_volume(app, VOL_STEP).await,
-        KeyCode::Char('-') | KeyCode::Char('_') => control_volume(app, -VOL_STEP).await,
-        KeyCode::Left => control_seek(app, -SEEK_STEP_MS).await,
-        KeyCode::Right => control_seek(app, SEEK_STEP_MS).await,
-        KeyCode::Char('s') => control_save(app).await,
+        KeyCode::Char(' ') => playback::control_toggle(app).await,
+        KeyCode::Char('n') => playback::control_next(app).await,
+        KeyCode::Char('p') => playback::control_prev(app).await,
+        KeyCode::Char('+') | KeyCode::Char('=') => playback::control_volume(app, VOL_STEP).await,
+        KeyCode::Char('-') | KeyCode::Char('_') => playback::control_volume(app, -VOL_STEP).await,
+        KeyCode::Left => playback::control_seek(app, -SEEK_STEP_MS).await,
+        KeyCode::Right => playback::control_seek(app, SEEK_STEP_MS).await,
+        KeyCode::Char('s') => playback::control_save(app).await,
         // Manual refresh: reset the failure counter and resume auto-refresh. Also clear art_url so
         // the cover art can be re-fetched (even a track whose art failed can be retried with `r` — no dead end).
         // While the library pane holds focus, also discard its current tab's cache and re-fetch, so
@@ -330,7 +325,7 @@ async fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
             app.art_url = None;
             if app.focus == view::Focus::Library {
                 app.browse_cache.clear(app.library.tab);
-                load_library(app, app.library.tab).await;
+                browse::load_library(app, app.library.tab).await;
             } else if app.focus == view::Focus::Detail {
                 // Force the detail to re-fetch: drop its cache entry and clear the key so the next
                 // `ensure_detail_loaded` reloads the current selection (recovers from a failed load
@@ -343,332 +338,6 @@ async fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
         _ => {}
     }
     false
-}
-
-/// The async action a search key press asks the main body to perform (computed while borrowing
-/// `app.mode`, then run after the borrow is dropped, since the async work re-borrows `app`).
-enum SearchAction {
-    None,
-    /// Close search and return to the dashboard.
-    Close,
-    /// Run a search with the query.
-    Submit(String),
-    /// Play the current selection (queue the songs list for a track, context-play otherwise).
-    Play,
-    /// Switch the category tab.
-    Tab(search::SearchTab),
-    /// Go back from results to editing the query.
-    BackToInput,
-}
-
-/// Key handling for the search dashboard. In the input phase, keys edit the query; in the results
-/// phase, `[`/`]` switch category tabs, `tab` toggles the results/detail focus, and ↑↓/Enter drive the
-/// focused pane. The synchronous state update happens under the borrow; the async action runs after.
-async fn handle_search_key(key: KeyEvent, app: &mut App) {
-    // Whether the detail pane was on screen at the last draw — used to clamp focus toggling to the
-    // panes actually visible (mirrors the Normal-mode `tab` handling).
-    let detail_visible = app.detail_visible;
-    let action = {
-        let Mode::Search(state) = &mut app.mode else {
-            return;
-        };
-        search_key_action(key, state, detail_visible)
-    };
-    match action {
-        SearchAction::None => {}
-        SearchAction::Close => app.mode = Mode::Normal,
-        SearchAction::Submit(q) => run_search(app, &q).await,
-        SearchAction::Play => search_play(app).await,
-        SearchAction::Tab(tab) => {
-            if let Mode::Search(state) = &mut app.mode {
-                state.set_tab(tab);
-            }
-        }
-        SearchAction::BackToInput => {
-            if let Mode::Search(state) = &mut app.mode {
-                state.back_to_input();
-            }
-        }
-    }
-}
-
-/// Update the query/selection/focus synchronously and return the async action to run.
-fn search_key_action(
-    key: KeyEvent,
-    state: &mut search::SearchState,
-    detail_visible: bool,
-) -> SearchAction {
-    use search::SearchPhase;
-    match state.phase {
-        SearchPhase::Input => match key.code {
-            KeyCode::Esc => SearchAction::Close,
-            KeyCode::Enter => {
-                if state.query.trim().is_empty() {
-                    SearchAction::None
-                } else {
-                    SearchAction::Submit(state.query.clone())
-                }
-            }
-            KeyCode::Backspace => {
-                state.query.pop();
-                SearchAction::None
-            }
-            KeyCode::Char(c) => {
-                state.query.push(c);
-                SearchAction::None
-            }
-            _ => SearchAction::None,
-        },
-        SearchPhase::Results => match key.code {
-            KeyCode::Esc => SearchAction::BackToInput,
-            KeyCode::Tab => {
-                state.focus = state.focus.next(detail_visible);
-                SearchAction::None
-            }
-            KeyCode::Char('[') => SearchAction::Tab(state.tab.prev()),
-            KeyCode::Char(']') => SearchAction::Tab(state.tab.next()),
-            KeyCode::Up => {
-                match state.focus.effective(detail_visible) {
-                    view::Focus::Library => state.select_prev(),
-                    view::Focus::Detail => state.detail.select_prev(),
-                }
-                SearchAction::None
-            }
-            KeyCode::Down => {
-                match state.focus.effective(detail_visible) {
-                    view::Focus::Library => state.select_next(),
-                    view::Focus::Detail => state.detail.select_next(),
-                }
-                SearchAction::None
-            }
-            KeyCode::Enter => SearchAction::Play,
-            _ => SearchAction::None,
-        },
-    }
-}
-
-/// Run the multi-type search and populate the results, staying in search either way. On failure the
-/// query is kept for editing and the reason is shown (status line and pane message; never silent).
-async fn run_search(app: &mut App, q: &str) {
-    match search::fetch(&app.client, q).await {
-        Ok(results) => {
-            if let Mode::Search(state) = &mut app.mode {
-                state.set_results(q.to_string(), results);
-            }
-        }
-        Err(e) => {
-            // `{e:#}` surfaces anyhow's full cause chain, so the real reason (auth, network, etc.) shows.
-            app.status = format!("{} search failed: {e:#}", theme::WARN);
-            if let Mode::Search(state) = &mut app.mode {
-                state.message = Some(format!("search failed: {e:#}"));
-            }
-        }
-    }
-}
-
-/// What to play for the current search selection: a track queues the whole songs list (so `next`/
-/// `prev` walk every song hit, starting at the selection); an artist/album context-plays.
-enum SearchPlay {
-    Queue { uris: Vec<String>, selected: usize },
-    Context(browse::PlayTarget),
-}
-
-/// Play the current search selection. Reports on the always-visible status line (search shares the
-/// dashboard, which draws `app.status`). A header/empty selection plays nothing.
-async fn search_play(app: &mut App) {
-    // Build the play plan under the borrow, then drop it before the async playback re-borrows app.
-    let plan = {
-        let Mode::Search(state) = &app.mode else {
-            return;
-        };
-        let Some(item) = state.selected_item() else {
-            return;
-        };
-        // Match every variant explicitly (like `browse::play`) so a new `PlayTarget` surfaces as a
-        // compile error here rather than silently falling into context playback.
-        match &item.target {
-            browse::PlayTarget::Track(uri) => match state.results.song_index(uri) {
-                // Queue every song hit so `next`/`prev` walk the list, starting at the selection.
-                Some(selected) => SearchPlay::Queue {
-                    uris: state.results.song_uris(),
-                    selected,
-                },
-                // The selection is a track not in the song list (should not happen — rows are rebuilt
-                // from `results`). Queue just that track so the *correct* song plays, never the first.
-                None => SearchPlay::Queue {
-                    uris: vec![uri.clone()],
-                    selected: 0,
-                },
-            },
-            browse::PlayTarget::Playlist(_)
-            | browse::PlayTarget::Album(_)
-            | browse::PlayTarget::Artist(_) => SearchPlay::Context(item.target.clone()),
-        }
-    };
-    let result = match plan {
-        SearchPlay::Queue { uris, selected } => start_playback_queue(app, &uris, selected).await,
-        SearchPlay::Context(target) => browse::play(&app.client, &target).await,
-    };
-    match result {
-        Ok(()) => {
-            app.status = format!("{} Playback started", theme::PLAY);
-            app.last_poll = None; // Reflect playback start on screen quickly.
-        }
-        Err(e) => {
-            app.status = format!("{} playback failed: {e:#}", theme::WARN);
-        }
-    }
-}
-
-async fn start_playback_queue(app: &App, uris: &[String], selected: usize) -> Result<()> {
-    let (ids, offset) = queue_from_uris(uris, selected)?;
-    auth::ensure_fresh_token(&app.client).await?;
-    app.client
-        .start_uris_playback(ids.into_iter().map(PlayableId::Track), None, offset, None)
-        .await
-        .context("failed to start playback (an active device may be required)")?;
-    Ok(())
-}
-
-/// Parse result URIs into track ids and compute the play offset for the selected index.
-/// Queueing every hit (not just the selected one) is what gives `next`/`prev` somewhere to go.
-/// A URI that fails to parse aborts the whole play rather than silently dropping a track.
-fn queue_from_uris(uris: &[String], selected: usize) -> Result<(Vec<TrackId<'_>>, Option<Offset>)> {
-    let ids = uris
-        .iter()
-        .map(|u| TrackId::from_uri(u))
-        .collect::<Result<Vec<_>, _>>()
-        .context("failed to parse a track URI")?;
-    let offset = uris.get(selected).map(|u| Offset::Uri(u.clone()));
-    Ok((ids, offset))
-}
-
-// ---- API integration --------------------------------------------------------
-
-/// Fetch the playback status and update `app.now`. Failures are shown on the status line.
-async fn poll_playback(app: &mut App) {
-    // Detect recovery (failures were ongoing until just now) to clear a lingering warning.
-    let was_failing = app.poll_failures > 0;
-    match fetch_playback(app).await {
-        Ok(Some(np)) => {
-            // On track change, discard the saved state and re-fetch it next (only on change, not every poll).
-            let prev_uri = app.now.as_ref().and_then(|n| n.track_uri.clone());
-            if np.track_uri != prev_uri {
-                app.saved = None;
-                app.saved_checked = false;
-            }
-            app.now = Some(np);
-            app.poll_failures = 0;
-            // On recovery, clear only if what remains is a stale ⚠ warning (do not clear a
-            // legitimate message from the user's last operation, i.e. Ok/Info).
-            if was_failing && view::status_kind(&app.status) == view::StatusKind::Warn {
-                app.status.clear();
-            }
-            refresh_saved(app).await;
-            refresh_art(app).await;
-        }
-        Ok(None) => {
-            app.now = None;
-            app.saved = None;
-            app.saved_checked = false;
-            app.art = None;
-            app.art_url = None;
-            app.poll_failures = 0;
-            if was_failing && view::status_kind(&app.status) == view::StatusKind::Warn {
-                app.status.clear();
-            }
-        }
-        Err(e) => {
-            app.poll_failures = app.poll_failures.saturating_add(1);
-            app.status = if app.poll_failures >= MAX_POLL_FAILURES {
-                format!(
-                    "{} auto-refresh stopped ({e}). Press r to retry / q to quit",
-                    theme::WARN
-                )
-            } else {
-                format!("{} refresh failed: {e}", theme::WARN)
-            };
-        }
-    }
-}
-
-async fn fetch_playback(app: &App) -> Result<Option<NowPlaying>> {
-    auth::ensure_fresh_token(&app.client).await?;
-    let ctx = app
-        .client
-        .current_playback(None, None::<Vec<_>>)
-        .await
-        .context("failed to fetch playback status")?;
-    Ok(ctx.map(snapshot_from_context))
-}
-
-/// Map rspotify's playback context into a display snapshot.
-fn snapshot_from_context(ctx: CurrentPlaybackContext) -> NowPlaying {
-    let device = ctx.device.name;
-    // By Spotify's contract this is 0-100, but as an external boundary, cap at 100 before casting to u8 (avoids a silent wraparound).
-    let volume = ctx.device.volume_percent.map(|v| v.min(100) as u8);
-    let progress_ms = ctx
-        .progress
-        .map(|d| d.num_milliseconds().max(0) as u128)
-        .unwrap_or(0);
-    let is_playing = ctx.is_playing;
-
-    // track_uri is used for the save action and track-change detection; album_image_url for cover-art fetching.
-    // Track uses the typed model; Unknown is extracted from raw JSON.
-    let (title, artists, album, duration_ms, track_uri, album_image_url) = match ctx.item {
-        Some(PlayableItem::Track(t)) => {
-            let artists: Vec<String> = t.artists.into_iter().map(|a| a.name).collect();
-            let dur = t.duration.num_milliseconds().max(0) as u128;
-            let uri = t.id.as_ref().map(|id| id.uri());
-            let images: Vec<(String, u32, u32)> = t
-                .album
-                .images
-                .into_iter()
-                .map(|im| (im.url, im.width.unwrap_or(0), im.height.unwrap_or(0)))
-                .collect();
-            let art_url = art::pick_image_url(&images);
-            (t.name, artists, Some(t.album.name), dur, uri, art_url)
-        }
-        Some(PlayableItem::Episode(e)) => {
-            let dur = e.duration.num_milliseconds().max(0) as u128;
-            (e.name, vec!["(podcast)".to_string()], None, dur, None, None)
-        }
-        // Like the status command, extract a fallback from the raw JSON that fell to Unknown.
-        Some(PlayableItem::Unknown(v)) => {
-            let (title, artists, album, dur) = crate::np_json::track_from_json(&v);
-            let images = crate::np_json::album_images_from_json(&v);
-            (
-                title,
-                artists,
-                album,
-                dur,
-                crate::np_json::track_id_from_json(&v),
-                art::pick_image_url(&images),
-            )
-        }
-        None => (
-            "(no track info while playing)".to_string(),
-            Vec::new(),
-            None,
-            0,
-            None,
-            None,
-        ),
-    };
-
-    NowPlaying {
-        is_playing,
-        title,
-        artists: join_artists(&artists),
-        album,
-        progress_ms,
-        duration_ms,
-        device,
-        volume,
-        track_uri,
-        album_image_url,
-        fetched_at: Instant::now(),
-    }
 }
 
 /// Refresh the retained client's token if needed. On failure, show it on the status line and return `false`.
@@ -694,499 +363,6 @@ fn finish<E: std::fmt::Display>(app: &mut App, res: Result<(), E>, ok: &str) {
                 "{} operation failed: {e} (press d to select and activate a device)",
                 theme::WARN
             );
-        }
-    }
-}
-
-async fn control_toggle(app: &mut App) {
-    let playing = app.now.as_ref().is_some_and(|n| n.is_playing);
-    if !ensure_ready(app).await {
-        return;
-    }
-    // To avoid a borrow conflict, settle the result first, then pass it to finish (&mut app).
-    if playing {
-        let res = app.client.pause_playback(None).await;
-        finish(app, res, &format!("{} Paused", theme::PAUSE));
-    } else {
-        let res = app.client.resume_playback(None, None).await;
-        finish(app, res, &format!("{} Playing", theme::PLAY));
-    }
-}
-
-async fn control_next(app: &mut App) {
-    if !ensure_ready(app).await {
-        return;
-    }
-    let res = app.client.next_track(None).await;
-    finish(app, res, &format!("{} Next track", theme::NEXT));
-}
-
-async fn control_prev(app: &mut App) {
-    if !ensure_ready(app).await {
-        return;
-    }
-    let res = app.client.previous_track(None).await;
-    finish(app, res, &format!("{} Previous track", theme::PREV));
-}
-
-async fn control_volume(app: &mut App, delta: i16) {
-    let Some(cur) = app.now.as_ref().and_then(|n| n.volume) else {
-        app.status = format!(
-            "{} device volume is unavailable (press d to select a device)",
-            theme::WARN
-        );
-        return;
-    };
-    let next = (cur as i16 + delta).clamp(0, 100) as u8;
-    if !ensure_ready(app).await {
-        return;
-    }
-    let res = app.client.volume(next, None).await;
-    finish(app, res, &format!("{} Volume {next}%", theme::VOLUME));
-}
-
-/// Fetch the current track's saved state and update `app.saved`. Best-effort: query only when
-/// `saved` is undetermined and a URI exists, and do not surface a status on failure (the main poll
-/// reports network/token errors, so do not overwrite the status and confuse the user here). The
-/// marker simply does not appear.
-async fn refresh_saved(app: &mut App) {
-    // Query only once per track (`saved_checked`). Do not hammer every poll even on persistent failure.
-    if app.saved_checked {
-        return;
-    }
-    let Some(uri) = app.now.as_ref().and_then(|n| n.track_uri.clone()) else {
-        return; // Unknown track (episodes, etc.) is not queried. No API call either.
-    };
-    let Ok(id) = TrackId::from_uri(&uri) else {
-        app.saved_checked = true;
-        return;
-    };
-    // A token-refresh failure is not a hard stop (the main poll reports the failure, and past the threshold auto-refresh itself stops).
-    if auth::ensure_fresh_token(&app.client).await.is_err() {
-        return;
-    }
-    // Regardless of success, stop re-querying for this track (best-effort).
-    app.saved_checked = true;
-    if let Ok(mut flags) = app.client.library_contains([LibraryId::Track(id)]).await {
-        app.saved = flags.pop();
-    }
-}
-
-/// Refresh the cover art. Re-fetch only when the current track's art URL differs from `art_url`
-/// (once per track, no retry on failure = best-effort). A fetch failure keeps the metadata display
-/// and is shown on the status line (no silent failures).
-async fn refresh_art(app: &mut App) {
-    let url = app.now.as_ref().and_then(|n| n.album_image_url.clone());
-    if url == app.art_url {
-        return; // No change (same track) → do not re-fetch
-    }
-    // Regardless of success, stop re-fetching for this URL (prevents hammering every poll).
-    app.art_url = url.clone();
-    let Some(url) = url else {
-        app.art = None; // No art (episodes, etc.)
-        return;
-    };
-    match art::fetch_decode(&app.http, &url).await {
-        Ok(img) => app.art = Some(app.picker.new_resize_protocol(img)),
-        Err(e) => {
-            app.art = None;
-            app.status = format!("{} failed to fetch cover art: {e}", theme::WARN);
-        }
-    }
-}
-
-/// Seek the current track by ±`delta_ms`. The target is computed from local progress (with
-/// interpolation), and on success progress is updated immediately and reflected on screen (no
-/// forced poll, to avoid appearing to rewind due to Connect's propagation delay). Repeated presses
-/// accumulate from the locally updated progress.
-async fn control_seek(app: &mut App, delta_ms: i64) {
-    let Some(n) = app.now.as_ref() else {
-        app.status = format!("{} nothing is playing", theme::WARN);
-        return;
-    };
-    let elapsed = n.fetched_at.elapsed().as_millis();
-    let current = view::interpolate_progress(n.progress_ms, elapsed, n.duration_ms, n.is_playing);
-    let target = view::seek_target(current, n.duration_ms, delta_ms);
-    if !ensure_ready(app).await {
-        return;
-    }
-    // target as i64: target is already clamped by duration_ms (and even when length is unknown, within a
-    // realistic number of presses), so it will not reach i64::MAX (~290 million years) — safe.
-    let res = app
-        .client
-        .seek_track(chrono::Duration::milliseconds(target as i64), None)
-        .await;
-    match res {
-        Ok(()) => {
-            // Reflect local progress immediately (no forced poll).
-            if let Some(n) = app.now.as_mut() {
-                n.progress_ms = target;
-                n.fetched_at = Instant::now();
-            }
-            app.status = format!("{} Seek {}", theme::SEEK, crate::format::format_ms(target));
-        }
-        Err(e) => {
-            app.status = format!(
-                "{} seek failed: {e} (press d to select and activate a device)",
-                theme::WARN
-            );
-        }
-    }
-}
-
-/// Save/unsave the current track in the library (`s`). Toggles to the opposite of the current saved state, updating it on success.
-async fn control_save(app: &mut App) {
-    let Some(uri) = app.now.as_ref().and_then(|n| n.track_uri.clone()) else {
-        app.status = format!(
-            "{} cannot save the current track (track info is unknown)",
-            theme::WARN
-        );
-        return;
-    };
-    let id = match TrackId::from_uri(&uri) {
-        Ok(id) => id,
-        Err(e) => {
-            app.status = format!("{} failed to parse the track URI: {e}", theme::WARN);
-            return;
-        }
-    };
-    if !ensure_ready(app).await {
-        return;
-    }
-    // If undetermined, interpret as "save".
-    let want_save = !app.saved.unwrap_or(false);
-    let res = if want_save {
-        app.client.library_add([LibraryId::Track(id)]).await
-    } else {
-        app.client.library_remove([LibraryId::Track(id)]).await
-    };
-    match res {
-        Ok(()) => {
-            app.saved = Some(want_save);
-            app.saved_checked = true;
-            app.status = if want_save {
-                format!("{} Saved to your library", theme::HEART)
-            } else {
-                format!("{} Removed from your library", theme::HEART_O)
-            };
-        }
-        Err(e) => {
-            app.status = format!("{} save operation failed: {e}", theme::WARN);
-        }
-    }
-}
-
-// ---- Library pane -----------------------------------------------------------
-
-/// Load the library once, after the first frame is drawn. Set the "attempted" flag before awaiting so
-/// a slow or failing initial fetch does not re-trigger every loop tick; switching tabs (or `r`) still
-/// forces a reload of an un-cached tab, so a failed startup is recoverable.
-async fn ensure_library_loaded(app: &mut App) {
-    if app.library_loaded {
-        return;
-    }
-    app.library_loaded = true;
-    let tab = app.library.tab;
-    load_library(app, tab).await;
-}
-
-/// Switch to `tab` and populate the library pane. Uses the per-tab cache when present (no network);
-/// otherwise fetches and caches. Fetch failure is never silent: it shows on the pane and the status
-/// line, and leaves the pane empty (switching tabs re-fetches, so it is not a dead end).
-async fn load_library(app: &mut App, tab: browse::BrowseTab) {
-    app.library.tab = tab;
-    // On a cache hit, reuse the stored note too — a persistent partial failure (e.g. Artists needs a
-    // re-login) keeps being reported every time the tab is shown, not just on the first load.
-    if let Some(loaded) = app.browse_cache.get(tab).cloned() {
-        let message = library_message(&loaded.rows, loaded.note, tab);
-        app.library.set_rows(loaded.rows, message);
-        return;
-    }
-    match browse::fetch(&app.client, tab).await {
-        Ok(loaded) => {
-            // Cache the whole load (rows + note); the clone is cheap for a few dozen small structs.
-            app.browse_cache.set(tab, loaded.clone());
-            let message = library_message(&loaded.rows, loaded.note, tab);
-            app.library.set_rows(loaded.rows, message);
-        }
-        Err(e) => {
-            // `{e:#}` shows anyhow's full cause chain (e.g. the 403 behind "failed to fetch followed
-            // artists"), so the message names the real cause — a missing scope, a timeout, etc. —
-            // instead of only the outermost context.
-            app.library
-                .set_rows(Vec::new(), Some(format!("failed to fetch: {e:#}")));
-            app.status = format!("{} failed to fetch the library: {e:#}", theme::WARN);
-        }
-    }
-}
-
-/// The pane message for a freshly loaded tab: the partial-failure note if any, else an "empty" notice
-/// when no playable rows loaded (so a 0-item tab is never silent), else `None` (the hint is shown).
-fn library_message(
-    rows: &[browse::LibraryRow],
-    note: Option<String>,
-    tab: browse::BrowseTab,
-) -> Option<String> {
-    if let Some(note) = note {
-        return Some(note);
-    }
-    if !rows.iter().any(browse::LibraryRow::is_selectable) {
-        return Some(format!("{} is empty", tab.label()));
-    }
-    None
-}
-
-/// Play the currently selected library item. Both outcomes report on the always-visible status line
-/// (the library pane is not a modal, so its own message is left as the load-derived note/hint and is
-/// never overwritten by a transient play result that would then go stale). A header selection plays
-/// nothing (headers are never selectable, so this only happens on an empty list, already messaged).
-async fn library_play(app: &mut App) {
-    let Some(target) = app.library.selected_item().map(|it| it.target.clone()) else {
-        return;
-    };
-    match browse::play(&app.client, &target).await {
-        Ok(()) => {
-            app.status = format!("{} Playback started", theme::PLAY);
-            app.last_poll = None;
-        }
-        Err(e) => {
-            // `{e:#}` surfaces anyhow's full cause chain, so playback failures name the real reason
-            // (no active device, parse error, etc.), not just the outermost context.
-            app.status = format!("{} playback failed: {e:#}", theme::WARN);
-        }
-    }
-}
-
-// ---- Detail pane ------------------------------------------------------------
-
-/// Load the detail for the current library selection, when it changed. Cached per library-item URI so
-/// scrolling back to a previously viewed item is free. Fetch failure and an empty track list are both
-/// surfaced (never silent). Runs each loop tick but returns early when the selection is unchanged.
-async fn ensure_detail_loaded(app: &mut App) {
-    // Clone the bits we need from the selected item, dropping the `app.library` borrow before the
-    // async fetch reaches for `app.client`.
-    let selected = app
-        .library
-        .selected_item()
-        .map(|it| (it.target.clone(), it.title.clone(), it.subtitle.clone()));
-    let Some((target, title, subtitle)) = selected else {
-        // Empty library or the selection is on a header: there is nothing to show a detail for.
-        if app.detail.key.is_some() || app.detail.message.is_none() {
-            app.detail.clear(Some("Nothing selected".to_string()));
-        }
-        return;
-    };
-    let key = target.uri().to_string();
-    if app.detail.key.as_deref() == Some(key.as_str()) {
-        return; // selection unchanged — keep the current detail (and its own selection)
-    }
-    if let Some(data) = app.detail_cache.get(&key).cloned() {
-        app.detail.set(key, data);
-        return;
-    }
-    let fallback = if subtitle.is_empty() {
-        title
-    } else {
-        format!("{title} — {subtitle}")
-    };
-    match detail::fetch(&app.client, &target, &fallback).await {
-        Ok(data) => {
-            // Bound the cache: clear it wholesale once it grows past the cap (keeps memory flat over
-            // a long session; re-fetches happen on demand).
-            if app.detail_cache.len() >= DETAIL_CACHE_MAX {
-                app.detail_cache.clear();
-            }
-            app.detail_cache.insert(key.clone(), data.clone());
-            app.detail.set(key, data);
-        }
-        Err(e) => {
-            // Surface the full cause chain (`{e:#}`): `detail::fetch_err` leads with a concise,
-            // user-facing message and keeps the underlying error for diagnosis; non-mapped failures
-            // (token refresh, URI parse) retain their own context. Non-silent in pane and status line.
-            let msg = format!("{e:#}");
-            app.detail.set_error(key, msg.clone());
-            app.status = format!("{} {msg}", theme::WARN);
-        }
-    }
-}
-
-/// Play the detail track list as a queue, starting at the selected row, so `next`/`prev` walk the
-/// list (the same all-URIs-queued invariant as search). Reports on the always-visible status line.
-async fn detail_play(app: &mut App) {
-    let uris: Vec<String> = app.detail.rows.iter().map(|r| r.uri.clone()).collect();
-    if uris.is_empty() {
-        return;
-    }
-    let selected = app.detail.selected;
-    match start_playback_queue(app, &uris, selected).await {
-        Ok(()) => {
-            app.status = format!("{} Playback started", theme::PLAY);
-            app.last_poll = None;
-        }
-        Err(e) => {
-            app.status = format!("{} playback failed: {e:#}", theme::WARN);
-        }
-    }
-}
-
-// ---- Search detail ----------------------------------------------------------
-
-/// Borrow the search state when the app is in search mode (`Box<SearchState>` derefs to the state).
-/// A small accessor so search handlers avoid repeating the `Mode::Search` destructure.
-fn search_state(app: &App) -> Option<&search::SearchState> {
-    match &app.mode {
-        Mode::Search(state) => Some(state),
-        _ => None,
-    }
-}
-
-/// Mutable counterpart of [`search_state`].
-fn search_state_mut(app: &mut App) -> Option<&mut search::SearchState> {
-    match &mut app.mode {
-        Mode::Search(state) => Some(state),
-        _ => None,
-    }
-}
-
-/// Load the highlight detail for the current search selection, when it changed. Mirrors
-/// [`ensure_detail_loaded`] but reads/writes the search state's own detail pane, and shares the same
-/// per-URI `detail_cache` so a result already viewed in the library (or vice versa) is free. Runs
-/// only while browsing results; a header/empty selection clears the pane (never silently blank).
-async fn ensure_search_detail_loaded(app: &mut App) {
-    let selected = match search_state(app) {
-        Some(state) if state.phase == search::SearchPhase::Results => state
-            .selected_item()
-            .map(|it| (it.target.clone(), it.title.clone(), it.subtitle.clone())),
-        _ => return,
-    };
-    let Some((target, title, subtitle)) = selected else {
-        if let Some(state) = search_state_mut(app)
-            && (state.detail.key.is_some() || state.detail.message.is_none())
-        {
-            state.detail.clear(Some("Nothing selected".to_string()));
-        }
-        return;
-    };
-    let key = target.uri().to_string();
-    if search_state(app).is_some_and(|s| s.detail.key.as_deref() == Some(key.as_str())) {
-        return; // selection unchanged — keep the current detail (and its own selection)
-    }
-    if let Some(data) = app.detail_cache.get(&key).cloned() {
-        if let Some(state) = search_state_mut(app) {
-            state.detail.set(key, data);
-        }
-        return;
-    }
-    let fallback = if subtitle.is_empty() {
-        title
-    } else {
-        format!("{title} — {subtitle}")
-    };
-    match detail::fetch(&app.client, &target, &fallback).await {
-        Ok(data) => {
-            if app.detail_cache.len() >= DETAIL_CACHE_MAX {
-                app.detail_cache.clear();
-            }
-            app.detail_cache.insert(key.clone(), data.clone());
-            if let Some(state) = search_state_mut(app) {
-                state.detail.set(key, data);
-            }
-        }
-        Err(e) => {
-            let msg = format!("{e:#}");
-            if let Some(state) = search_state_mut(app) {
-                state.detail.set_error(key, msg.clone());
-            }
-            app.status = format!("{} {msg}", theme::WARN);
-        }
-    }
-}
-
-// ---- Device picker ----------------------------------------------------------
-
-/// Key handling for the device picker overlay. Updates the selection synchronously and runs the required async action.
-async fn handle_devices_key(key: KeyEvent, app: &mut App) {
-    let action = {
-        let Mode::Devices(state) = &mut app.mode else {
-            return;
-        };
-        devices::key_action(key, state)
-    };
-    match action {
-        devices::DeviceAction::None => {}
-        devices::DeviceAction::Close => app.mode = Mode::Normal,
-        devices::DeviceAction::Transfer => devices_transfer(app).await,
-        devices::DeviceAction::Reload => open_devices(app).await,
-    }
-}
-
-/// Fetch the device list and enter selection mode. Empty list / fetch failure are reported (no silent failures).
-/// Devices come and go, so they are not cached and are re-fetched every time it opens.
-async fn open_devices(app: &mut App) {
-    let items = match devices::fetch(&app.client).await {
-        Ok(items) => items,
-        Err(e) => {
-            // If selecting, stay on screen and show a message; if in the normal view, put it on the status line.
-            if let Mode::Devices(state) = &mut app.mode {
-                state.message = Some(format!("failed to fetch: {e}"));
-            } else {
-                app.status = format!("{} failed to fetch the device list: {e}", theme::WARN);
-            }
-            return;
-        }
-    };
-    let message = items
-        .is_empty()
-        .then(|| "No playable devices. Please open the Spotify app".to_string());
-    // On re-fetch, snap to the active position (or the first) so the selection does not fall out of range.
-    let selected = items.iter().position(|d| d.is_active).unwrap_or(0);
-    app.mode = Mode::Devices(devices::DevicePickerState {
-        items,
-        selected,
-        message,
-    });
-}
-
-/// Transfer playback to the selected device. On success return to the normal view and poll immediately; on failure keep it on the overlay.
-/// Non-transferable devices (no ID / restricted) are rejected up front and reported via a message.
-async fn devices_transfer(app: &mut App) {
-    let target = match &app.mode {
-        Mode::Devices(state) => state.items.get(state.selected).cloned(),
-        _ => None,
-    };
-    let Some(target) = target else {
-        return;
-    };
-    if target.is_restricted {
-        if let Mode::Devices(state) = &mut app.mode {
-            state.message = Some(format!(
-                "'{}' is restricted and cannot be transferred to",
-                target.name
-            ));
-        }
-        return;
-    }
-    let Some(id) = target.id.as_deref() else {
-        if let Mode::Devices(state) = &mut app.mode {
-            state.message = Some(format!(
-                "'{}' has no ID and cannot be transferred to",
-                target.name
-            ));
-        }
-        return;
-    };
-    match devices::transfer(&app.client, id).await {
-        Ok(()) => {
-            app.status = format!("{} Moved playback to '{}'", theme::PLAY, target.name);
-            app.last_poll = None; // Reflect the transfer into Now Playing quickly
-            app.mode = Mode::Normal;
-        }
-        Err(e) => {
-            if let Mode::Devices(state) = &mut app.mode {
-                state.message = Some(format!("transfer failed: {e}"));
-            } else {
-                app.status = format!("{} transfer failed: {e}", theme::WARN);
-            }
         }
     }
 }
@@ -1239,7 +415,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         ModeKind::Normal | ModeKind::Search => draw_dashboard(frame, app),
         ModeKind::Devices => {
             if let Mode::Devices(state) = &app.mode {
-                draw_devices(frame, state);
+                devices::draw_devices(frame, state);
             }
         }
         ModeKind::Help => draw_help(frame),
@@ -1367,18 +543,18 @@ fn draw_dashboard(frame: &mut ratatui::Frame, app: &mut App) {
     }
     // The search bar row is present only in search mode (pure splitter returns `Some` then).
     if let Some(bar) = areas.search_bar {
-        draw_search_bar(frame, app, bar);
+        search::draw_search_bar(frame, app, bar);
     }
     // Lower panes: search swaps in the results/highlight; Normal shows the library/detail.
     if search_active {
-        draw_search_results_pane(frame, app, areas.library, focus == view::Focus::Library);
+        search::draw_search_results_pane(frame, app, areas.library, focus == view::Focus::Library);
         if let Some(detail_area) = areas.detail {
-            draw_search_detail_pane(frame, app, detail_area, focus == view::Focus::Detail);
+            search::draw_search_detail_pane(frame, app, detail_area, focus == view::Focus::Detail);
         }
     } else {
-        draw_library_pane(frame, app, areas.library, focus == view::Focus::Library);
+        browse::draw_library_pane(frame, app, areas.library, focus == view::Focus::Library);
         if let Some(detail_area) = areas.detail {
-            draw_detail_pane(frame, app, detail_area, focus == view::Focus::Detail);
+            detail::draw_detail_pane(frame, app, detail_area, focus == view::Focus::Detail);
         }
     }
 
@@ -1396,66 +572,7 @@ fn draw_dashboard(frame: &mut ratatui::Frame, app: &mut App) {
     // Draw the Now Playing pane last: it is the only region that borrows `&mut app` (for the cover
     // art), so every immutable read above is already done. `art_cols` is the width already reserved
     // above (0 = no column), reused here so the split matches the width `render_lines` was given.
-    draw_now_playing_pane(frame, app, areas.now_playing, art_cols, &v);
-}
-
-/// Draw the Now Playing pane: an optional cover-art column of `art_cols` columns on the left (0 =
-/// none) and the text lines on the right. The text rows are placed by `view::stack_rows` in priority
-/// order (state / title / artist / album / device), so a short pane drops the lower rows first
-/// instead of letting the layout solver crush an arbitrary one to height 0. Progress is shown by the
-/// bottom playbar, not here. The cover art is rendered last so `&mut app.art` is the final borrow.
-fn draw_now_playing_pane(
-    frame: &mut ratatui::Frame,
-    app: &mut App,
-    area: ratatui::layout::Rect,
-    art_cols: u16,
-    v: &view::RenderLines,
-) {
-    // A placeholder is shown even when art is absent/not yet fetched, to make the empty state
-    // explicit. `art_cols` (from `view::art_col_width`) is 0 when no column should be shown.
-    let (art_area, text_area) = if art_cols > 0 {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(art_cols), Constraint::Min(1)])
-            .split(area);
-        (Some(cols[0]), cols[1])
-    } else {
-        (None, area)
-    };
-
-    // Priority-ordered rows: highest first, so `stack_rows` drops device/album before title.
-    let bold = Style::default().add_modifier(Modifier::BOLD);
-    let accent = Style::default()
-        .fg(theme::GREEN)
-        .add_modifier(Modifier::BOLD);
-    let plain = Style::default();
-    let lines = [
-        (v.state.as_str(), accent),
-        (v.title.as_str(), bold),
-        (v.artist.as_str(), plain),
-        (v.album.as_str(), plain),
-        (v.device.as_str(), plain),
-    ];
-    for ((text, style), rect) in lines.iter().zip(view::stack_rows(text_area, lines.len())) {
-        frame.render_widget(Paragraph::new(*text).style(*style), rect);
-    }
-
-    // Cover art last (first `&mut app.art` borrow). Placeholder makes the empty state explicit.
-    if let Some(art_rect) = art_area {
-        if let Some(art) = app.art.as_mut() {
-            frame.render_stateful_widget(StatefulImage::default(), art_rect, art);
-        } else {
-            let art_placeholder = Paragraph::new(format!("{}\n\n(no art)", theme::MUSIC))
-                .alignment(Alignment::Center)
-                .style(Style::default().add_modifier(Modifier::DIM))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(theme::GREEN)),
-                );
-            frame.render_widget(art_placeholder, art_rect);
-        }
-    }
+    playback::draw_now_playing_pane(frame, app, areas.now_playing, art_cols, &v);
 }
 
 /// Draw the always-present status line. If auto-refresh has stopped, always show the notice (drawn
@@ -1489,39 +606,6 @@ fn draw_playbar(frame: &mut ratatui::Frame, ratio: f64, label: &str, area: ratat
             .gauge_style(Style::default().fg(theme::GREEN))
             .use_unicode(true),
         area,
-    );
-}
-
-/// Draw the always-visible library pane (lower-left dashboard region). Delegates to the shared
-/// tabbed-list renderer; a message (loading / empty / error / partial-failure note) takes precedence
-/// over the default item-count hint so the pane is never silent.
-fn draw_library_pane(
-    frame: &mut ratatui::Frame,
-    app: &App,
-    area: ratatui::layout::Rect,
-    focused: bool,
-) {
-    let item_count = app
-        .library
-        .rows
-        .iter()
-        .filter(|r| r.is_selectable())
-        .count();
-    let hint = app
-        .library
-        .message
-        .clone()
-        .unwrap_or_else(|| view::library_hint(item_count));
-    draw_tabbed_list_pane(
-        frame,
-        area,
-        focused,
-        " Library ",
-        view::library_tab_header(app.library.tab),
-        hint,
-        &app.library.rows,
-        app.library.selected,
-        app.library.selected_item().is_some(),
     );
 }
 
@@ -1595,266 +679,4 @@ fn draw_tabbed_list_pane(
             .add_modifier(Modifier::BOLD),
     );
     frame.render_stateful_widget(list, rows[2], &mut list_state);
-}
-
-/// Draw the always-visible detail pane (lower-right dashboard region): a bordered block with the
-/// context title, a hint/message line, and the track list for the currently selected library item.
-/// The currently-playing track (matched by URI against Now Playing) is prefixed with the play glyph;
-/// the list selection is the `▶ ` marker. Border highlighted (GREEN bold) while focused.
-fn draw_detail_pane(
-    frame: &mut ratatui::Frame,
-    app: &App,
-    area: ratatui::layout::Rect,
-    focused: bool,
-) {
-    let current = app.now.as_ref().and_then(|n| n.track_uri.as_deref());
-    draw_detail_state(frame, area, focused, &app.detail, current);
-}
-
-/// Render a detail pane from any `DetailState` (shared by the library detail and the search
-/// highlight): a bordered block with the context title, a hint/message line, and the track list.
-/// `now_uri` is the currently-playing track's URI so its row is glyph-marked and bolded. The list
-/// selection is the `▶ ` marker; border highlighted (GREEN bold) while focused.
-fn draw_detail_state(
-    frame: &mut ratatui::Frame,
-    area: ratatui::layout::Rect,
-    focused: bool,
-    detail: &detail::DetailState,
-    now_uri: Option<&str>,
-) {
-    let dim = Style::default().add_modifier(Modifier::DIM);
-    let bold = Style::default().add_modifier(Modifier::BOLD);
-    let border_style = if focused {
-        Style::default()
-            .fg(theme::GREEN)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        dim
-    };
-    let title = if detail.title.is_empty() {
-        " Details ".to_string()
-    } else {
-        format!(" {} ", detail.title)
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .title(title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.height == 0 || inner.width == 0 {
-        return;
-    }
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1)]) // hint / list
-        .split(inner);
-
-    let hint = detail.message.clone().unwrap_or_else(|| {
-        if detail.key.is_none() {
-            // Nothing has resolved yet (before the first selection loads): show a loading note
-            // instead of a misleading "0 tracks".
-            "Loading…".to_string()
-        } else {
-            view::detail_hint(detail.rows.len())
-        }
-    });
-    frame.render_widget(Paragraph::new(hint).style(dim), rows[0]);
-
-    let width = inner.width as usize;
-    let items: Vec<ListItem> = detail
-        .rows
-        .iter()
-        .map(|r| {
-            let is_current = now_uri == Some(r.uri.as_str());
-            let text = view::detail_row(
-                r.track_no,
-                &r.title,
-                &r.artists,
-                r.duration_ms,
-                is_current,
-                width,
-            );
-            let item = ListItem::new(text);
-            // Bold the currently-playing row so the glyph is not the only cue.
-            if is_current { item.style(bold) } else { item }
-        })
-        .collect();
-    let mut list_state = ListState::default();
-    if !detail.rows.is_empty() {
-        list_state.select(Some(detail.selected));
-    }
-    let list = List::new(items).highlight_symbol("▶ ").highlight_style(
-        Style::default()
-            .fg(theme::GREEN)
-            .add_modifier(Modifier::BOLD),
-    );
-    frame.render_stateful_widget(list, rows[1], &mut list_state);
-}
-
-/// Draw the search input bar (the row revealed above the lower panes in search mode). Shows the query
-/// with a cursor while typing; in the results phase the cursor is hidden and a short hint is appended.
-fn draw_search_bar(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
-    let Mode::Search(state) = &app.mode else {
-        return;
-    };
-    let bold = Style::default().add_modifier(Modifier::BOLD);
-    let cursor = if state.phase == search::SearchPhase::Input {
-        "▌"
-    } else {
-        ""
-    };
-    frame.render_widget(
-        Paragraph::new(format!("{} {}{}", theme::SEARCH, state.query, cursor)).style(bold),
-        area,
-    );
-}
-
-/// Draw the search results pane (lower-left in search mode). Delegates to the shared tabbed-list
-/// renderer with the category tabs and result rows; a message (no results / error) takes precedence
-/// over the default hint so the pane is never silent.
-fn draw_search_results_pane(
-    frame: &mut ratatui::Frame,
-    app: &App,
-    area: ratatui::layout::Rect,
-    focused: bool,
-) {
-    let Some(state) = search_state(app) else {
-        return;
-    };
-    let item_count = state.rows.iter().filter(|r| r.is_selectable()).count();
-    let hint = state
-        .message
-        .clone()
-        .unwrap_or_else(|| view::search_results_hint(item_count));
-    draw_tabbed_list_pane(
-        frame,
-        area,
-        focused,
-        " Search ",
-        view::search_tab_header(state.tab),
-        hint,
-        &state.rows,
-        state.selected,
-        state.selected_item().is_some(),
-    );
-}
-
-/// Draw the search highlight pane (lower-right in search mode): the track list for the selected
-/// result, via the shared [`draw_detail_state`].
-fn draw_search_detail_pane(
-    frame: &mut ratatui::Frame,
-    app: &App,
-    area: ratatui::layout::Rect,
-    focused: bool,
-) {
-    let Mode::Search(state) = &app.mode else {
-        return;
-    };
-    let current = app.now.as_ref().and_then(|n| n.track_uri.as_deref());
-    draw_detail_state(frame, area, focused, &state.detail, current);
-}
-
-/// Device picker view (list + selection highlight).
-fn draw_devices(frame: &mut ratatui::Frame, state: &devices::DevicePickerState) {
-    let area = frame.area();
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::GREEN))
-        .title(" spotterm — Devices ");
-    let inner = outer.inner(area);
-    frame.render_widget(outer, area);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // hint
-            Constraint::Min(1),    // list
-            Constraint::Length(1), // footer
-        ])
-        .split(inner);
-
-    let dim = Style::default().add_modifier(Modifier::DIM);
-
-    let hint = state.message.clone().unwrap_or_else(|| {
-        format!(
-            "{} devices — ↑↓ select / Enter transfer / r refresh / Esc back",
-            state.items.len()
-        )
-    });
-    frame.render_widget(Paragraph::new(hint).style(dim), rows[0]);
-
-    // List (device-row formatting is delegated to the pure function `view::device_row`).
-    let width = inner.width as usize;
-    let items: Vec<ListItem> = state
-        .items
-        .iter()
-        .map(|d| {
-            ListItem::new(view::device_row(
-                &d.name,
-                &d.type_label,
-                d.volume,
-                d.is_active,
-                d.is_restricted,
-                width,
-            ))
-        })
-        .collect();
-    let mut list_state = ListState::default();
-    if !state.items.is_empty() {
-        list_state.select(Some(state.selected));
-    }
-    let list = List::new(items).highlight_symbol("▶ ").highlight_style(
-        Style::default()
-            .fg(theme::GREEN)
-            .add_modifier(Modifier::BOLD),
-    );
-    frame.render_stateful_widget(list, rows[1], &mut list_state);
-
-    frame.render_widget(
-        Paragraph::new("↑↓ select   Enter transfer   r refresh   Esc back   Ctrl-C quit")
-            .alignment(Alignment::Center)
-            .style(dim),
-        rows[2],
-    );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn uri(id: &str) -> String {
-        format!("spotify:track:{id}")
-    }
-
-    #[test]
-    fn queue_from_uris_queues_all_hits_and_offsets_to_selection() {
-        let uris = vec![uri("4iV5W9uYEdYUVa79Axb7Rh"), uri("1301WleyT98MSxVHPZCA6M")];
-
-        let (ids, offset) = queue_from_uris(&uris, 1).unwrap();
-
-        // Every hit is queued so `next`/`prev` have somewhere to go...
-        assert_eq!(ids.len(), 2);
-        // ...and playback starts at the selected track, not the first one.
-        assert_eq!(offset, Some(Offset::Uri(uris[1].clone())));
-    }
-
-    #[test]
-    fn queue_from_uris_rejects_an_unparseable_uri() {
-        let uris = vec![uri("4iV5W9uYEdYUVa79Axb7Rh"), "not-a-uri".to_string()];
-
-        assert!(queue_from_uris(&uris, 0).is_err());
-    }
-
-    #[test]
-    fn queue_from_uris_without_a_matching_selection_omits_the_offset() {
-        let uris = vec![uri("4iV5W9uYEdYUVa79Axb7Rh")];
-
-        // `selected` past the end yields no offset (Spotify then starts at the queue head).
-        let (ids, offset) = queue_from_uris(&uris, 9).unwrap();
-
-        assert_eq!(ids.len(), 1);
-        assert_eq!(offset, None);
-    }
 }
