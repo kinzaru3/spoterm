@@ -29,7 +29,8 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 use rspotify::AuthCodePkceSpotify;
@@ -559,7 +560,7 @@ fn draw_dashboard(frame: &mut ratatui::Frame, app: &mut App) {
     }
 
     draw_status_line(frame, app, areas.status);
-    draw_playbar(frame, v.ratio, &v.progress_label, areas.playbar);
+    draw_playbar(frame, &v, areas.playbar);
     if let Some(footer) = areas.footer {
         frame.render_widget(
             Paragraph::new("tab focus   ? help   q quit")
@@ -597,16 +598,35 @@ fn draw_status_line(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout
     frame.render_widget(Paragraph::new(text).style(style), area);
 }
 
-/// Draw the bottom playback bar (single source of progress). A graphical redesign is a later phase.
-fn draw_playbar(frame: &mut ratatui::Frame, ratio: f64, label: &str, area: ratatui::layout::Rect) {
-    frame.render_widget(
-        Gauge::default()
-            .ratio(ratio)
-            .label(label.to_owned())
-            .gauge_style(Style::default().fg(theme::GREEN))
-            .use_unicode(true),
-        area,
+/// Draw the bottom playback bar (the single source of progress): a play/pause glyph, the elapsed
+/// time, a graphical `▬▬●───` slider, the total time, and a `▮▮▯▯▯ 40%` volume bar. All layout math
+/// (including the narrow-terminal degrade that keeps the volume visible) lives in the pure
+/// `view::playbar_segments`; this only maps each segment to a color (accent = green, knob = bold
+/// green, track/empty = dim).
+fn draw_playbar(frame: &mut ratatui::Frame, v: &view::RenderLines, area: ratatui::layout::Rect) {
+    let green = Style::default().fg(theme::GREEN);
+    let knob_style = green.add_modifier(Modifier::BOLD);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+
+    let segs = view::playbar_segments(
+        area.width as usize,
+        v.is_playing,
+        v.ratio,
+        &v.elapsed_label,
+        &v.total_label,
+        v.volume,
     );
+    let spans: Vec<Span> = segs
+        .into_iter()
+        .map(|s| match s {
+            view::PlaybarSeg::Accent(t) => Span::styled(t, green),
+            view::PlaybarSeg::Knob(t) => Span::styled(t, knob_style),
+            view::PlaybarSeg::Track(t) => Span::styled(t, dim),
+            view::PlaybarSeg::Plain(t) => Span::raw(t),
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Shared renderer for the lower-left tabbed list pane (library and search results): a bordered block

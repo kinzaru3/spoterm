@@ -47,6 +47,21 @@ pub const HEART_O: &str = "\u{f08a}"; // nf-fa-heart_o
 /// Check mark — login success (CLI output).
 pub const CHECK: &str = "\u{f00c}"; // nf-fa-check
 
+// --- Playback / volume bar glyphs ---
+// Decorative box-drawing glyphs for the bottom playbar. Deliberately *not* Nerd Font PUA (they are
+// ordinary Unicode and render without a patched font) and deliberately kept out of `OK_PREFIXES` so
+// the status-line classifier never mistakes a bar glyph for a status prefix.
+/// Played portion of the progress slider.
+pub const PROGRESS_FILLED: &str = "▬";
+/// Current-position knob on the progress slider.
+pub const PROGRESS_KNOB: &str = "●";
+/// Unplayed portion of the progress slider.
+pub const PROGRESS_TRACK: &str = "─";
+/// Filled volume segment.
+pub const VOL_FILLED: &str = "▮";
+/// Empty volume segment.
+pub const VOL_EMPTY: &str = "▯";
+
 /// The set of status prefixes classified as [`super::view::StatusKind::Ok`]. `status_kind` matches
 /// against these, so this list is the single definition shared by the classifier and its tests.
 pub const OK_PREFIXES: &[&str] = &[PLAY, PAUSE, NEXT, PREV, SEEK, VOLUME, HEART, HEART_O];
@@ -73,5 +88,42 @@ mod tests {
     fn warn_is_not_an_ok_prefix() {
         // A warning line must never be misclassified as ok.
         assert!(!OK_PREFIXES.contains(&WARN));
+    }
+
+    #[test]
+    fn bar_glyphs_are_nonempty_and_distinct() {
+        let bars = [
+            PROGRESS_FILLED,
+            PROGRESS_KNOB,
+            PROGRESS_TRACK,
+            VOL_FILLED,
+            VOL_EMPTY,
+        ];
+        assert!(
+            bars.iter().all(|g| !g.is_empty()),
+            "no bar glyph may be empty"
+        );
+        for (i, a) in bars.iter().enumerate() {
+            for b in &bars[i + 1..] {
+                assert_ne!(a, b, "bar glyphs must be distinct: {a:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn bar_glyphs_are_not_ok_prefixes() {
+        // Decorative bar glyphs must never leak into the status-line classifier.
+        for g in [
+            PROGRESS_FILLED,
+            PROGRESS_KNOB,
+            PROGRESS_TRACK,
+            VOL_FILLED,
+            VOL_EMPTY,
+        ] {
+            assert!(
+                !OK_PREFIXES.contains(&g),
+                "bar glyph must not be a status prefix: {g:?}"
+            );
+        }
     }
 }
