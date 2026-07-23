@@ -442,6 +442,30 @@ pub fn detail_row(
     format!("{body}{}{dur}", " ".repeat(pad))
 }
 
+/// The queue pane's supplementary line (the default hint shown above the list). `upcoming` is the
+/// number of tracks queued after the currently-playing one.
+pub fn queue_hint(upcoming: usize) -> String {
+    format!("{upcoming} up next")
+}
+
+/// Format one queue-pane row: `{marker}{title} — {artists}`, truncated to the pane width. The
+/// currently-playing track (`number == None`) is prefixed with the play glyph; upcoming tracks pass
+/// their 1-based queue position as `Some(n)` and are numbered. The pane is display-only (no selection
+/// marker), so unlike `detail_row` the full width is available. Pure (primitives in, `String` out) so
+/// it is unit-tested without building API models.
+pub fn queue_row(number: Option<usize>, title: &str, artists: &str, width: usize) -> String {
+    let marker = match number {
+        None => format!("{} ", theme::PLAY),
+        Some(n) => format!("{n}. "),
+    };
+    let body = if artists.is_empty() {
+        format!("{marker}{title}")
+    } else {
+        format!("{marker}{title} — {artists}")
+    };
+    truncate(&body, width)
+}
+
 /// Pure function that formats one device row for the device picker.
 /// Active is shown with `● (active)`, inactive with `○`, and restricted is annotated.
 /// Truncates at a width reduced by the 2 columns of the selection marker `"▶ "`.
@@ -514,7 +538,7 @@ pub fn status_kind(s: &str) -> StatusKind {
 
 // ---- Dashboard layout (pure region splitting) -------------------------------
 
-/// Below this inner width the dashboard collapses to a single column (visualizer and detail are
+/// Below this inner width the dashboard collapses to a single column (queue and detail are
 /// dropped) so the remaining panes stay legible on narrow terminals. The boundary is inclusive:
 /// a width of exactly this many columns still shows two columns.
 const MIN_TWO_COL_WIDTH: u16 = 60;
@@ -522,9 +546,9 @@ const MIN_TWO_COL_WIDTH: u16 = 60;
 /// The Now Playing pane needs ~5 text rows (state / title / artist / album / device) but only gets
 /// ~45% of the body, so the footer is only worth showing once the body is comfortably tall.
 const MIN_FOOTER_HEIGHT: u16 = 12;
-/// Below this inner height the visualizer pane is dropped (checked after the footer, i.e. 12 → 10),
-/// so degradation removes the footer first and the visualizer second.
-const MIN_VISUALIZER_HEIGHT: u16 = 10;
+/// Below this inner height the queue pane is dropped (checked after the footer, i.e. 12 → 10),
+/// so degradation removes the footer first and the queue second.
+const MIN_QUEUE_HEIGHT: u16 = 10;
 
 /// Which lower dashboard pane currently holds keyboard focus. Only the lower two panes (library and
 /// detail) are navigable; the upper Now Playing / Visualizer panes are display-only, so they are not
@@ -570,8 +594,8 @@ impl Focus {
 pub struct DashboardAreas {
     /// Upper-left Now Playing pane (always present).
     pub now_playing: Rect,
-    /// Upper-right visualizer pane (`None` on narrow or short terminals).
-    pub visualizer: Option<Rect>,
+    /// Upper-right queue pane (`None` on narrow or short terminals).
+    pub queue: Option<Rect>,
     /// The search input row (`Some` only while search is active). Populated by the pure splitter and
     /// asserted by unit tests; the Phase 1 `draw` calls with search inactive and does not render it
     /// yet (search still uses its own overlay view), so it is not read from the binary target.
@@ -609,11 +633,11 @@ pub struct DashboardAreas {
 ///
 /// The body is then split with the layout solver: vertically into `upper / (search_bar) / lower`
 /// (search bar only when `search_active`), and each of those horizontally into
-/// `now_playing / visualizer` and `library / detail` (single column when narrow/short).
+/// `now_playing / queue` and `library / detail` (single column when narrow/short).
 pub fn dashboard_areas(inner: Rect, search_active: bool) -> DashboardAreas {
     let two_col = inner.width >= MIN_TWO_COL_WIDTH;
     let show_footer = inner.height >= MIN_FOOTER_HEIGHT;
-    let show_visualizer = two_col && inner.height >= MIN_VISUALIZER_HEIGHT;
+    let show_queue = two_col && inner.height >= MIN_QUEUE_HEIGHT;
 
     // 1. Reserve the mandatory bottom rows arithmetically, status first (see the doc comment). This
     //    guarantees status/playbar never collapse to height 0 while the terminal can still show them,
@@ -662,8 +686,8 @@ pub fn dashboard_areas(inner: Rect, search_active: bool) -> DashboardAreas {
         (rows[0], None, rows[1])
     };
 
-    // 3. Split the upper row into now_playing / visualizer.
-    let (now_playing, visualizer) = if show_visualizer {
+    // 3. Split the upper row into now_playing / queue.
+    let (now_playing, queue) = if show_queue {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -686,7 +710,7 @@ pub fn dashboard_areas(inner: Rect, search_active: bool) -> DashboardAreas {
 
     DashboardAreas {
         now_playing,
-        visualizer,
+        queue,
         search_bar,
         library,
         detail,
@@ -753,7 +777,7 @@ mod tests {
         let a = dashboard_areas(inner, false);
 
         // Assert: all optional panes present, no search bar.
-        let vis = a.visualizer.expect("visualizer present when wide/tall");
+        let vis = a.queue.expect("queue present when wide/tall");
         let detail = a.detail.expect("detail present when wide");
         let footer = a.footer.expect("footer present when tall");
         assert!(a.search_bar.is_none(), "no search bar when inactive");
@@ -786,23 +810,23 @@ mod tests {
         let a = dashboard_areas(inner, false);
 
         // Assert
-        assert!(a.visualizer.is_none(), "no visualizer when narrow");
+        assert!(a.queue.is_none(), "no queue when narrow");
         assert!(a.detail.is_none(), "no detail when narrow");
         assert_eq!(a.now_playing.width, inner.width);
         assert_eq!(a.library.width, inner.width);
     }
 
     #[test]
-    fn dashboard_short_drops_footer_before_visualizer() {
-        // Height 11: footer gone (< 12) but visualizer kept (>= 10).
+    fn dashboard_short_drops_footer_before_queue() {
+        // Height 11: footer gone (< 12) but queue kept (>= 10).
         let a = dashboard_areas(Rect::new(0, 0, 100, 11), false);
         assert!(a.footer.is_none(), "footer dropped below 12 rows");
-        assert!(a.visualizer.is_some(), "visualizer kept at 11 rows");
+        assert!(a.queue.is_some(), "queue kept at 11 rows");
 
-        // Height 9: both footer and visualizer gone (< 10).
+        // Height 9: both footer and queue gone (< 10).
         let b = dashboard_areas(Rect::new(0, 0, 100, 9), false);
         assert!(b.footer.is_none());
-        assert!(b.visualizer.is_none(), "visualizer dropped below 10 rows");
+        assert!(b.queue.is_none(), "queue dropped below 10 rows");
     }
 
     #[test]
@@ -826,7 +850,7 @@ mod tests {
         let a = dashboard_areas(inner, true);
         for r in [
             Some(a.now_playing),
-            a.visualizer,
+            a.queue,
             a.search_bar,
             Some(a.library),
             a.detail,
@@ -868,9 +892,9 @@ mod tests {
     fn dashboard_thresholds_are_inclusive_boundaries() {
         // Width exactly at the two-column boundary keeps both columns; one below collapses.
         let wide = dashboard_areas(Rect::new(0, 0, MIN_TWO_COL_WIDTH, 30), false);
-        assert!(wide.visualizer.is_some() && wide.detail.is_some());
+        assert!(wide.queue.is_some() && wide.detail.is_some());
         let narrow = dashboard_areas(Rect::new(0, 0, MIN_TWO_COL_WIDTH - 1, 30), false);
-        assert!(narrow.visualizer.is_none() && narrow.detail.is_none());
+        assert!(narrow.queue.is_none() && narrow.detail.is_none());
 
         // Height exactly at the footer threshold keeps the footer; one below drops it.
         let with_footer = dashboard_areas(Rect::new(0, 0, 100, MIN_FOOTER_HEIGHT), false);
@@ -878,11 +902,11 @@ mod tests {
         let no_footer = dashboard_areas(Rect::new(0, 0, 100, MIN_FOOTER_HEIGHT - 1), false);
         assert!(no_footer.footer.is_none());
 
-        // Height exactly at the visualizer threshold keeps it; one below drops it.
-        let with_vis = dashboard_areas(Rect::new(0, 0, 100, MIN_VISUALIZER_HEIGHT), false);
-        assert!(with_vis.visualizer.is_some());
-        let no_vis = dashboard_areas(Rect::new(0, 0, 100, MIN_VISUALIZER_HEIGHT - 1), false);
-        assert!(no_vis.visualizer.is_none());
+        // Height exactly at the queue threshold keeps it; one below drops it.
+        let with_vis = dashboard_areas(Rect::new(0, 0, 100, MIN_QUEUE_HEIGHT), false);
+        assert!(with_vis.queue.is_some());
+        let no_vis = dashboard_areas(Rect::new(0, 0, 100, MIN_QUEUE_HEIGHT - 1), false);
+        assert!(no_vis.queue.is_none());
     }
 
     #[test]
@@ -1326,6 +1350,36 @@ mod tests {
         let out = detail_row(None, "Song", "", 60_000, false, 30);
         assert!(out.starts_with("Song"));
         assert!(out.trim_end().ends_with("1:00"));
+    }
+
+    #[test]
+    fn queue_row_marks_currently_playing_with_play_glyph() {
+        let out = queue_row(None, "15 Step", "Radiohead", 40);
+        assert!(out.starts_with(theme::PLAY));
+        assert!(out.contains("15 Step — Radiohead"));
+    }
+
+    #[test]
+    fn queue_row_numbers_upcoming_tracks() {
+        let out = queue_row(Some(3), "Nude", "Radiohead", 40);
+        assert_eq!(out, "3. Nude — Radiohead");
+    }
+
+    #[test]
+    fn queue_row_omits_dash_when_no_artists() {
+        let out = queue_row(Some(1), "Interlude", "", 40);
+        assert_eq!(out, "1. Interlude");
+    }
+
+    #[test]
+    fn queue_row_truncates_to_width() {
+        let out = queue_row(Some(1), "abcdefghijklmnop", "", 8);
+        assert!(crate::format::display_width(&out) <= 8);
+    }
+
+    #[test]
+    fn queue_hint_reports_upcoming_count() {
+        assert_eq!(queue_hint(5), "5 up next");
     }
 
     #[test]

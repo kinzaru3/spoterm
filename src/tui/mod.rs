@@ -12,6 +12,7 @@ mod browse;
 mod detail;
 mod devices;
 mod playback;
+mod queue;
 mod search;
 mod view;
 
@@ -140,6 +141,8 @@ struct App {
     art: Option<StatefulProtocol>,
     /// The image URL `art` corresponds to. Re-fetched only on track change (URL change).
     art_url: Option<String>,
+    /// The playback queue shown in the display-only upper-right pane. Refreshed on the playback poll.
+    queue: queue::QueueState,
 }
 
 /// `spotterm tui`: launch the Now Playing dashboard.
@@ -196,6 +199,7 @@ async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify, picker: Pick
         picker,
         art: None,
         art_url: None,
+        queue: queue::QueueState::default(),
     };
 
     // For auto-clearing the status line (detect changes and time them. Not stored on App; handled within this loop).
@@ -210,6 +214,7 @@ async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify, picker: Pick
         let timer_due = app.last_poll.is_none_or(|t| t.elapsed() >= POLL_INTERVAL);
         if forced || (timer_due && app.poll_failures < MAX_POLL_FAILURES) {
             playback::poll_playback(&mut app).await;
+            queue::poll_queue(&mut app).await;
             app.last_poll = Some(Instant::now());
         }
 
@@ -467,32 +472,6 @@ fn draw_help(frame: &mut ratatui::Frame) {
     );
 }
 
-/// A bordered placeholder pane (for regions not yet implemented in this phase). It is a visible
-/// label rather than an empty area, so the region never silently reads as broken. When `focused` is
-/// true the border is drawn in solid GREEN (the same accent used for selection elsewhere); otherwise
-/// it is dimmed. Display-only panes (e.g. Visualizer) always pass `focused = false`.
-fn placeholder_pane(title: &str, focused: bool) -> Paragraph<'_> {
-    let dim = Style::default().add_modifier(Modifier::DIM);
-    let (text_style, border_style) = if focused {
-        (
-            Style::default(),
-            Style::default()
-                .fg(theme::GREEN)
-                .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        (dim, dim)
-    };
-    Paragraph::new(title)
-        .alignment(Alignment::Center)
-        .style(text_style)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(border_style),
-        )
-}
-
 /// Normal (dashboard) view. A thin orchestrator: it draws the outer frame, asks the pure
 /// `view::dashboard_areas` to carve the inner area into regions, and hands each region to a focused
 /// sub-function. Regions returned as `None` (too small a terminal) are simply skipped. In this phase
@@ -532,15 +511,15 @@ fn draw_dashboard(frame: &mut ratatui::Frame, app: &mut App) {
 
     // Placeholder panes for later phases (visible labels, never silently blank). The focused lower
     // pane is highlighted; focus clamps to the library when the detail pane is hidden (narrow term),
-    // so the highlight never lands on a pane the user cannot see. Visualizer is display-only.
+    // so the highlight never lands on a pane the user cannot see. The queue pane is display-only.
     let detail_visible = areas.detail.is_some();
     // Record it so the `tab` key handler (which has no access to the frame size) can clamp focus
     // navigation to the panes actually on screen.
     app.detail_visible = detail_visible;
     // In search mode the focused pane comes from the search state; otherwise from `app.focus`.
     let focus = search_focus.unwrap_or(app.focus).effective(detail_visible);
-    if let Some(vis) = areas.visualizer {
-        frame.render_widget(placeholder_pane("Visualizer", false), vis);
+    if let Some(queue_area) = areas.queue {
+        queue::draw_queue_pane(frame, app, queue_area);
     }
     // The search bar row is present only in search mode (pure splitter returns `Some` then).
     if let Some(bar) = areas.search_bar {
