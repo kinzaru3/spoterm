@@ -1,6 +1,6 @@
 [package]
 name = "spotterm"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 description = "Spotify を操作する CLI / TUI（公式 Web API・PKCE 認証）"

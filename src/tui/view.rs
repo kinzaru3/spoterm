@@ -4,8 +4,12 @@
 
 use std::time::Instant;
 
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+
 use crate::format::{display_width, format_ms, truncate};
 use crate::theme;
+use crate::tui::browse::BrowseTab;
+use crate::tui::search::SearchTab;
 
 /// A snapshot of the playback status from the most recent poll. Using `fetched_at` as the base,
 /// progress between polls is interpolated locally to look smooth.
@@ -54,6 +58,179 @@ pub fn progress_ratio(progress_ms: u128, duration_ms: u128) -> f64 {
     (progress_ms as f64 / duration_ms as f64).clamp(0.0, 1.0)
 }
 
+/// A progress slider split into its three segments so the layout math stays pure and unit-testable
+/// while the draw layer only assigns colors. Each glyph is one column wide, so
+/// `filled + knob + track` spans exactly `width` columns (`width == 0` yields all-empty, no knob).
+pub struct ProgressBar {
+    pub filled: String,
+    pub knob: String,
+    pub track: String,
+}
+
+/// Build a `▬▬▬●─────` progress slider `width` columns wide from a `ratio` (clamped to 0.0..=1.0).
+/// The knob marks the current position: everything left of it is filled, everything right is the
+/// unplayed track. `width == 0` returns empty segments (nothing to draw).
+pub fn progress_bar(ratio: f64, width: usize) -> ProgressBar {
+    if width == 0 {
+        return ProgressBar {
+            filled: String::new(),
+            knob: String::new(),
+            track: String::new(),
+        };
+    }
+    // One column is always the knob; the remaining `last` columns are split filled/track.
+    let last = width - 1;
+    let pos = (ratio.clamp(0.0, 1.0) * last as f64).round() as usize;
+    let pos = pos.min(last);
+    ProgressBar {
+        filled: theme::PROGRESS_FILLED.repeat(pos),
+        knob: theme::PROGRESS_KNOB.to_string(),
+        track: theme::PROGRESS_TRACK.repeat(last - pos),
+    }
+}
+
+/// A volume bar split into filled/empty segments plus a numeric percent label, so the draw layer can
+/// color the filled part. `segments` is the block count. An unknown volume (`None`) renders all-empty
+/// blocks with a `-` label (never silently blank) so an unavailable device stays visible.
+pub struct VolumeBar {
+    pub filled: String,
+    pub empty: String,
+    pub label: String,
+}
+
+/// Format a `▮▮▯▯▯ 40%` volume bar with `segments` blocks. The percent is clamped to 0..=100 and the
+/// filled block count is rounded to the nearest segment.
+pub fn volume_bar(volume: Option<u8>, segments: usize) -> VolumeBar {
+    match volume {
+        Some(v) => {
+            let v = (v as usize).min(100);
+            let filled = ((v * segments + 50) / 100).min(segments);
+            VolumeBar {
+                filled: theme::VOL_FILLED.repeat(filled),
+                empty: theme::VOL_EMPTY.repeat(segments - filled),
+                label: format!("{v}%"),
+            }
+        }
+        None => VolumeBar {
+            filled: String::new(),
+            empty: theme::VOL_EMPTY.repeat(segments),
+            label: "-".to_string(),
+        },
+    }
+}
+
+/// Number of blocks in the playbar's volume bar.
+pub const VOL_SEGMENTS: usize = 5;
+/// Minimum slider width worth drawing; below this the playbar drops the slider (keeping the times).
+const MIN_SLIDER_WIDTH: usize = 3;
+/// Spacing between the time block and the volume block.
+const PLAYBAR_GAP: usize = 3;
+
+/// One styled piece of the bottom playbar. Kept free of ratatui so the whole layout (including the
+/// narrow-terminal degrade) is a pure, testable function; the draw layer maps each variant to a color.
+pub enum PlaybarSeg {
+    /// Accent (green): the play/pause glyph and the filled progress/volume blocks.
+    Accent(String),
+    /// The progress knob (green, emphasized).
+    Knob(String),
+    /// Dim: the unplayed progress track and the empty volume blocks.
+    Track(String),
+    /// Default color: time labels, gaps, the volume icon and its percent label.
+    Plain(String),
+}
+
+/// Total column width of a segment list (each glyph is one column). A test-only invariant check that
+/// the playbar never exceeds its area width.
+#[cfg(test)]
+pub fn playbar_width(segs: &[PlaybarSeg]) -> usize {
+    segs.iter()
+        .map(|s| match s {
+            PlaybarSeg::Accent(t)
+            | PlaybarSeg::Knob(t)
+            | PlaybarSeg::Track(t)
+            | PlaybarSeg::Plain(t) => display_width(t),
+        })
+        .sum()
+}
+
+/// Build the bottom playbar as styled segments that fit within `width` columns:
+/// `{▶|⏸} {elapsed} {▬▬●───} {total}   {🔊} {▮▮▯▯▯} {40%}`. The slider is the flexible filler; when
+/// the terminal is too narrow for it (`< MIN_SLIDER_WIDTH`) the slider is dropped in favor of
+/// `elapsed / total` text, and when even that will not fit the times are dropped too — but the volume
+/// block is always kept (never silently clipped), honoring the "no silent failure" invariant.
+pub fn playbar_segments(
+    width: usize,
+    is_playing: bool,
+    ratio: f64,
+    elapsed: &str,
+    total: &str,
+    volume: Option<u8>,
+) -> Vec<PlaybarSeg> {
+    let icon = if is_playing {
+        theme::PLAY
+    } else {
+        theme::PAUSE
+    };
+    let vb = volume_bar(volume, VOL_SEGMENTS);
+
+    // The volume block is kept at all costs; append it to `segs` as the rightmost pieces.
+    let push_volume = |segs: &mut Vec<PlaybarSeg>| {
+        segs.push(PlaybarSeg::Plain(format!("{} ", theme::VOLUME)));
+        segs.push(PlaybarSeg::Accent(vb.filled.clone()));
+        segs.push(PlaybarSeg::Track(vb.empty.clone()));
+        segs.push(PlaybarSeg::Plain(format!(" {}", vb.label)));
+    };
+    let icon_w = display_width(icon) + 1; // "{icon} "
+    let vol_w = display_width(theme::VOLUME) + 1 + VOL_SEGMENTS + 1 + display_width(&vb.label);
+
+    let mut segs = vec![PlaybarSeg::Accent(format!("{icon} "))];
+
+    // Full layout: fill the leftover width with the slider.
+    let elapsed_w = display_width(elapsed) + 1; // "{elapsed} "
+    let total_w = 1 + display_width(total) + PLAYBAR_GAP; // " {total}   "
+    let full_fixed = icon_w + elapsed_w + total_w + vol_w;
+    let slider = width.saturating_sub(full_fixed);
+    if slider >= MIN_SLIDER_WIDTH {
+        let pb = progress_bar(ratio, slider);
+        segs.push(PlaybarSeg::Plain(format!("{elapsed} ")));
+        segs.push(PlaybarSeg::Accent(pb.filled));
+        segs.push(PlaybarSeg::Knob(pb.knob));
+        segs.push(PlaybarSeg::Track(pb.track));
+        segs.push(PlaybarSeg::Plain(format!(
+            " {total}{}",
+            " ".repeat(PLAYBAR_GAP)
+        )));
+        push_volume(&mut segs);
+        return segs;
+    }
+
+    // Too narrow for a slider: show the times as `elapsed / total` if they still fit alongside volume.
+    let mid = format!("{elapsed} / {total}{}", " ".repeat(PLAYBAR_GAP));
+    if icon_w + display_width(&mid) + vol_w <= width {
+        segs.push(PlaybarSeg::Plain(mid));
+        push_volume(&mut segs);
+        return segs;
+    }
+
+    // Even the times will not fit: drop them but keep the volume block. Keep it colored while it
+    // fits; on a pathologically narrow terminal fall back to a single truncated plain piece so the
+    // bar never overflows for *any* width (`truncate` guarantees `display_width <= width`).
+    if icon_w + vol_w <= width {
+        push_volume(&mut segs);
+        return segs;
+    }
+    segs.clear();
+    let compact = format!(
+        "{icon} {} {}{} {}",
+        theme::VOLUME,
+        vb.filled,
+        vb.empty,
+        vb.label
+    );
+    segs.push(PlaybarSeg::Plain(truncate(&compact, width)));
+    segs
+}
+
 /// The lines needed for rendering (primitive strings + progress ratio). Kept independent of
 /// ratatui so the render logic is a pure function and unit testable (`mod.rs::draw` just feeds
 /// these into widgets).
@@ -62,8 +239,14 @@ pub struct RenderLines {
     pub title: String,
     pub artist: String,
     pub album: String,
+    /// Whether playback is active — selects the play/pause glyph on the bottom playbar.
+    pub is_playing: bool,
     pub ratio: f64,
-    pub progress_label: String,
+    /// Elapsed / total time labels for the playbar (e.g. `"1:23"` / `"5:18"`; `"-"` when idle).
+    pub elapsed_label: String,
+    pub total_label: String,
+    /// Current device volume 0..=100, or `None` when unknown. Rendered as the playbar's volume bar.
+    pub volume: Option<u8>,
     pub device: String,
 }
 
@@ -96,11 +279,14 @@ pub fn render_lines(
     let Some(n) = now else {
         return RenderLines {
             state: "Nothing is playing".to_string(),
-            title: "  (press p to resume / `spotterm play` to start)".to_string(),
+            title: "  (press / to search, 2 to browse, d to select a device)".to_string(),
             artist: String::new(),
             album: String::new(),
+            is_playing: false,
             ratio: 0.0,
-            progress_label: "-".to_string(),
+            elapsed_label: "-".to_string(),
+            total_label: "-".to_string(),
+            volume: None,
             device: String::new(),
         };
     };
@@ -111,10 +297,6 @@ pub fn render_lines(
     } else {
         format!("{} Paused", theme::PAUSE)
     };
-    let vol = n
-        .volume
-        .map(|v| format!("{v}%"))
-        .unwrap_or_else(|| "-".to_string());
 
     RenderLines {
         state: format!("{head}{}", saved_marker(saved)),
@@ -125,9 +307,13 @@ pub fn render_lines(
             .as_deref()
             .map(|a| line(&format!("{} ", theme::ALBUM), a))
             .unwrap_or_default(),
+        is_playing: n.is_playing,
         ratio: progress_ratio(prog, n.duration_ms),
-        progress_label: format!("{} / {}", format_ms(prog), format_ms(n.duration_ms)),
-        device: format!("{} {} (vol {vol})", theme::VOLUME, n.device),
+        elapsed_label: format_ms(prog),
+        total_label: format_ms(n.duration_ms),
+        volume: n.volume,
+        // Volume moved to the playbar's volume bar (issue #26 Phase 6); the device line is name-only.
+        device: format!("{} {}", theme::VOLUME, n.device),
     }
 }
 
@@ -147,16 +333,6 @@ pub fn seek_target(current_ms: u128, duration_ms: u128, delta_ms: i64) -> u128 {
     }
 }
 
-/// The supplementary line of the search overlay (the default hint when there is no `message`).
-/// Varies by phase and result count.
-pub fn search_hint(is_input: bool, results_len: usize) -> String {
-    if is_input {
-        "Enter to search / Esc to go back".to_string()
-    } else {
-        format!("{results_len} results — ↑↓ select / Enter play / Esc edit query")
-    }
-}
-
 /// Format one search-result row (`name — artists`, truncated to the width). Selection highlighting
 /// is done by the caller. Truncates at a width reduced by the 2 columns of the selection marker `"▶ "`.
 pub fn search_row(name: &str, artists: &str, width: usize) -> String {
@@ -166,6 +342,128 @@ pub fn search_row(name: &str, artists: &str, width: usize) -> String {
         format!("{name} — {artists}")
     };
     truncate(&text, width.saturating_sub(2))
+}
+
+/// The library pane tab header, e.g. `[All] Artists  Albums  Playlists  Tracks`. The current tab is
+/// wrapped in brackets so it reads as selected even without color. Pure and testable.
+pub fn library_tab_header(current: BrowseTab) -> String {
+    BrowseTab::ALL
+        .iter()
+        .map(|t| {
+            if *t == current {
+                format!("[{}]", t.label())
+            } else {
+                format!(" {} ", t.label())
+            }
+        })
+        .collect()
+}
+
+/// The library pane's supplementary line (the default hint when there is no `message`). `count` is
+/// the number of playable items (headers excluded).
+pub fn library_hint(count: usize) -> String {
+    format!("{count} items — ↑↓ select / [ ] tab / Enter play")
+}
+
+/// The search results pane tab header, e.g. `[Top] Songs  Artists  Albums`. Mirrors
+/// `library_tab_header`: the current category is bracketed so it reads as selected without color.
+pub fn search_tab_header(current: SearchTab) -> String {
+    SearchTab::ALL
+        .iter()
+        .map(|t| {
+            if *t == current {
+                format!("[{}]", t.label())
+            } else {
+                format!(" {} ", t.label())
+            }
+        })
+        .collect()
+}
+
+/// The search results pane's supplementary line (the default hint when there is no `message`).
+/// `count` is the number of playable items shown for the current category (headers excluded).
+pub fn search_results_hint(count: usize) -> String {
+    format!("{count} results — ↑↓ select / [ ] category / Enter play / Esc edit")
+}
+
+/// The detail pane's supplementary line (the default hint when there is no `message`). `count` is the
+/// number of tracks shown.
+pub fn detail_hint(count: usize) -> String {
+    format!("{count} tracks — ↑↓ select / Enter play")
+}
+
+/// Turn a failed detail fetch into a concise, non-alarming pane message. `what` is the content label
+/// ("artist top tracks", "playlist tracks", …) and `status` is the HTTP status when the failure was an
+/// HTTP response. `403` is the common case for content Spotify's Web API restricts for this app's
+/// access tier (artist top-tracks and other users' / editorial playlists have been restricted since
+/// late 2024) — surface it as an expected limitation, not a scary error, while still never staying
+/// silent. Pure (primitives in, `String` out) so the mapping is unit-tested without HTTP models.
+pub fn detail_error_message(status: Option<u16>, what: &str) -> String {
+    match status {
+        Some(403) => format!("{what} unavailable — restricted by Spotify Web API (403)"),
+        Some(404) => format!("{what} not found (404)"),
+        Some(code) => format!("failed to load {what} (HTTP {code})"),
+        None => format!("failed to load {what}"),
+    }
+}
+
+/// Format one detail-pane track row: `{▶ }{no} {title} — {artists}` on the left with the duration
+/// right-aligned to the pane width. The currently-playing track is prefixed with the play glyph
+/// (distinct from the list's `▶ ` selection marker). Truncates at a width reduced by the 2 columns of
+/// the selection marker, and reserves room for the right-aligned duration so it is never clipped.
+/// Pure (primitives in, `String` out) so it is unit-tested without building API models.
+pub fn detail_row(
+    track_no: Option<u32>,
+    title: &str,
+    artists: &str,
+    duration_ms: u128,
+    is_current: bool,
+    width: usize,
+) -> String {
+    let marker = if is_current {
+        format!("{} ", theme::PLAY)
+    } else {
+        String::new()
+    };
+    let no = track_no.map(|n| format!("{n} ")).unwrap_or_default();
+    let body = if artists.is_empty() {
+        format!("{marker}{no}{title}")
+    } else {
+        format!("{marker}{no}{title} — {artists}")
+    };
+    let dur = format_ms(duration_ms);
+    // Reserve the 2 columns the list highlight symbol occupies, then keep the duration (plus a gap)
+    // pinned to the right by truncating the body and padding the middle.
+    let avail = width.saturating_sub(2);
+    let dur_w = display_width(&dur);
+    let body_max = avail.saturating_sub(dur_w + 1);
+    let body = truncate(&body, body_max);
+    let pad = avail.saturating_sub(display_width(&body) + dur_w);
+    format!("{body}{}{dur}", " ".repeat(pad))
+}
+
+/// The queue pane's supplementary line (the default hint shown above the list). `upcoming` is the
+/// number of tracks queued after the currently-playing one.
+pub fn queue_hint(upcoming: usize) -> String {
+    format!("{upcoming} up next")
+}
+
+/// Format one queue-pane row: `{marker}{title} — {artists}`, truncated to the pane width. The
+/// currently-playing track (`number == None`) is prefixed with the play glyph; upcoming tracks pass
+/// their 1-based queue position as `Some(n)` and are numbered. The pane is display-only (no selection
+/// marker), so unlike `detail_row` the full width is available. Pure (primitives in, `String` out) so
+/// it is unit-tested without building API models.
+pub fn queue_row(number: Option<usize>, title: &str, artists: &str, width: usize) -> String {
+    let marker = match number {
+        None => format!("{} ", theme::PLAY),
+        Some(n) => format!("{n}. "),
+    };
+    let body = if artists.is_empty() {
+        format!("{marker}{title}")
+    } else {
+        format!("{marker}{title} — {artists}")
+    };
+    truncate(&body, width)
 }
 
 /// Pure function that formats one device row for the device picker.
@@ -204,9 +502,12 @@ pub fn help_entries() -> &'static [(&'static str, &'static str)] {
         ("+ / -", "volume ±5"),
         ("s", "save / unsave the current track"),
         ("/", "search and play"),
-        ("2", "browse library"),
+        ("tab", "focus panel (library / detail)"),
+        ("[ / ]", "library: previous / next tab"),
+        ("↑ / ↓", "library / detail: move selection"),
+        ("enter", "library / detail: play selection"),
         ("d", "select device"),
-        ("r", "refresh (resume auto-refresh)"),
+        ("r", "refresh (playback / focused library tab or detail)"),
         ("?", "this help"),
         ("q / Esc", "quit"),
         ("Ctrl-C", "quit (from any screen)"),
@@ -235,9 +536,461 @@ pub fn status_kind(s: &str) -> StatusKind {
     }
 }
 
+// ---- Dashboard layout (pure region splitting) -------------------------------
+
+/// Below this inner width the dashboard collapses to a single column (queue and detail are
+/// dropped) so the remaining panes stay legible on narrow terminals. The boundary is inclusive:
+/// a width of exactly this many columns still shows two columns.
+const MIN_TWO_COL_WIDTH: u16 = 60;
+/// Below this inner height the footer row is dropped first (its keys also live in the help overlay).
+/// The Now Playing pane needs ~5 text rows (state / title / artist / album / device) but only gets
+/// ~45% of the body, so the footer is only worth showing once the body is comfortably tall.
+const MIN_FOOTER_HEIGHT: u16 = 12;
+/// Below this inner height the queue pane is dropped (checked after the footer, i.e. 12 → 10),
+/// so degradation removes the footer first and the queue second.
+const MIN_QUEUE_HEIGHT: u16 = 10;
+
+/// Which lower dashboard pane currently holds keyboard focus. Only the lower two panes (library and
+/// detail) are navigable; the upper Now Playing / Visualizer panes are display-only, so they are not
+/// part of the focus cycle. Kept a small, exhaustively-matched enum so adding a future focus target
+/// surfaces missing branches as compile errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    /// The lower-left library pane.
+    Library,
+    /// The lower-right detail pane.
+    Detail,
+}
+
+impl Focus {
+    /// The focus after a `tab` press, given whether the detail pane is currently shown. With the
+    /// detail pane hidden (narrow terminal) there is only one navigable pane, so focus stays on the
+    /// library — the stored focus is clamped *at the moment of navigation*, not just at render time.
+    /// This keeps `App.focus` always consistent with what is on screen, so widening the terminal
+    /// later never makes focus "jump" to a pane the user did not deliberately move to.
+    pub fn next(self, detail_visible: bool) -> Focus {
+        if !detail_visible {
+            return Focus::Library;
+        }
+        match self {
+            Focus::Library => Focus::Detail,
+            Focus::Detail => Focus::Library,
+        }
+    }
+
+    /// The focus that should actually be rendered, given whether the detail pane is currently shown.
+    /// A render-time safety belt: even though `next` already clamps on navigation, the terminal can
+    /// be resized between a key press and the next draw, so clamp here too. On a narrow terminal the
+    /// detail pane is hidden, so focus can never rest on a pane the user cannot see — it clamps back
+    /// to the library instead of silently highlighting nothing.
+    pub fn effective(self, detail_visible: bool) -> Focus {
+        if detail_visible { self } else { Focus::Library }
+    }
+}
+
+/// The dashboard regions carved out of the inner area (inside the outer border). Optional regions
+/// are `None` when the terminal is too small (or, for `search_bar`, when search is inactive) so the
+/// caller simply skips drawing them.
+pub struct DashboardAreas {
+    /// Upper-left Now Playing pane (always present).
+    pub now_playing: Rect,
+    /// Upper-right queue pane (`None` on narrow or short terminals).
+    pub queue: Option<Rect>,
+    /// The search input row (`Some` only while search is active). Populated by the pure splitter and
+    /// asserted by unit tests; the Phase 1 `draw` calls with search inactive and does not render it
+    /// yet (search still uses its own overlay view), so it is not read from the binary target.
+    #[allow(dead_code)]
+    pub search_bar: Option<Rect>,
+    /// Lower-left library pane (always present).
+    pub library: Rect,
+    /// Lower-right detail pane (`None` on narrow terminals).
+    pub detail: Option<Rect>,
+    /// The status line. Its height is reserved arithmetically before any other row, so it is the
+    /// last thing to disappear as the terminal shrinks (it is the only non-silent output). It is
+    /// `>= 1` row whenever `inner.height >= 1`.
+    pub status: Rect,
+    /// The playback bar row. Reserved right after `status`, so it is `>= 1` row whenever
+    /// `inner.height >= 2`.
+    pub playbar: Rect,
+    /// The footer/key-hint row (`None` on short terminals).
+    pub footer: Option<Rect>,
+}
+
+/// Split the inner area (inside the outer border) into dashboard regions. Pure and
+/// terminal-independent (works on hand-built `Rect`s), so it is unit-testable without a backend.
+///
+/// The mandatory bottom rows are reserved with plain arithmetic (not the layout solver, which can
+/// collapse rows to height 0 on short terminals). Highest priority first: `status`, then `playbar`,
+/// then `footer` (only when tall enough); whatever remains becomes the body. Pseudocode:
+///
+/// ```text
+/// remaining = inner.height
+/// status_h  = min(remaining, 1); remaining -= status_h   // survives down to height 1
+/// playbar_h = min(remaining, 1); remaining -= playbar_h   // survives down to height 2
+/// footer_h  = show_footer ? min(remaining, 1) : 0; remaining -= footer_h
+/// body_h    = remaining                                   // upper + search bar + lower
+/// ```
+///
+/// The body is then split with the layout solver: vertically into `upper / (search_bar) / lower`
+/// (search bar only when `search_active`), and each of those horizontally into
+/// `now_playing / queue` and `library / detail` (single column when narrow/short).
+pub fn dashboard_areas(inner: Rect, search_active: bool) -> DashboardAreas {
+    let two_col = inner.width >= MIN_TWO_COL_WIDTH;
+    let show_footer = inner.height >= MIN_FOOTER_HEIGHT;
+    let show_queue = two_col && inner.height >= MIN_QUEUE_HEIGHT;
+
+    // 1. Reserve the mandatory bottom rows arithmetically, status first (see the doc comment). This
+    //    guarantees status/playbar never collapse to height 0 while the terminal can still show them,
+    //    which keeps the status line — the only non-silent output — visible.
+    let mut remaining = inner.height;
+    let status_h = remaining.min(1);
+    remaining -= status_h;
+    let playbar_h = remaining.min(1);
+    remaining -= playbar_h;
+    let footer_h = if show_footer { remaining.min(1) } else { 0 };
+    remaining -= footer_h;
+    let body_h = remaining;
+
+    // Stack the rows from the top: body, then status, playbar, footer along the bottom.
+    let x = inner.x;
+    let w = inner.width;
+    let mut y = inner.y;
+    let body = Rect::new(x, y, w, body_h);
+    y += body_h;
+    let status = Rect::new(x, y, w, status_h);
+    y += status_h;
+    let playbar = Rect::new(x, y, w, playbar_h);
+    y += playbar_h;
+    let footer = if show_footer {
+        Some(Rect::new(x, y, w, footer_h))
+    } else {
+        None
+    };
+
+    // 2. Split the body into upper / (search_bar) / lower.
+    let (upper, search_bar, lower) = if search_active {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(45),
+                Constraint::Length(1),
+                Constraint::Min(1),
+            ])
+            .split(body);
+        (rows[0], Some(rows[1]), rows[2])
+    } else {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .split(body);
+        (rows[0], None, rows[1])
+    };
+
+    // 3. Split the upper row into now_playing / queue.
+    let (now_playing, queue) = if show_queue {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(upper);
+        (cols[0], Some(cols[1]))
+    } else {
+        (upper, None)
+    };
+
+    // 4. Split the lower row into library / detail.
+    let (library, detail) = if two_col {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(41), Constraint::Percentage(59)])
+            .split(lower);
+        (cols[0], Some(cols[1]))
+    } else {
+        (lower, None)
+    };
+
+    DashboardAreas {
+        now_playing,
+        queue,
+        search_bar,
+        library,
+        detail,
+        status,
+        playbar,
+        footer,
+    }
+}
+
+/// True on a hidden→visible transition of the queue pane (#38), so the caller can force an
+/// immediate re-poll and not leave the pane stuck on "Loading…" for up to one poll interval. Pure so
+/// the "poll right after it reappears" rule is unit-tested without driving the loop.
+pub fn queue_became_visible(prev: bool, now: bool) -> bool {
+    now && !prev
+}
+
+/// Cover-art columns are square; terminal cells are about twice as tall as wide, so a column of
+/// `height * 2` columns renders roughly square.
+const ART_COL_ASPECT: u16 = 2;
+/// Never let the cover-art column exceed this many columns (keep room for the text).
+const ART_COL_MAX: u16 = 24;
+/// Below this many columns an art column is not worth showing; fall back to full-width text.
+const ART_COL_MIN: u16 = 4;
+
+/// The width (in columns) of the cover-art column inside the Now Playing pane, or `0` when no
+/// column is shown. Pure so the caller can subtract it from the pane width *before* building the
+/// text lines, keeping the truncation width in sync with the actual text rectangle. `want_art` is
+/// false when nothing is playing (no art to show). The column is square-ish (`pane_h * 2`), capped
+/// at half the pane width and [`ART_COL_MAX`]; anything under [`ART_COL_MIN`] collapses to `0`.
+pub fn art_col_width(pane_w: u16, pane_h: u16, want_art: bool) -> u16 {
+    if !want_art {
+        return 0;
+    }
+    let cols = pane_h
+        .saturating_mul(ART_COL_ASPECT)
+        .min(pane_w / 2)
+        .min(ART_COL_MAX);
+    if cols >= ART_COL_MIN { cols } else { 0 }
+}
+
+/// Allocate up to `count` single-row `Rect`s stacked from the top of `area`, dropping any that do
+/// not fit (so the caller can lay out priority-ordered rows without the layout solver collapsing an
+/// arbitrary one to height 0). Each returned rect is exactly one row tall and inside `area`. Reused
+/// for the Now Playing text rows (state / title / artist / album / device, highest priority first).
+pub fn stack_rows(area: Rect, count: usize) -> Vec<Rect> {
+    (0..count)
+        .map(|i| area.y.saturating_add(i as u16))
+        .take_while(|&y| y < area.bottom())
+        .map(|y| Rect::new(area.x, y, area.width, 1))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// True when `r` sits entirely inside `outer` (no boundary overflow).
+    fn within(outer: Rect, r: Rect) -> bool {
+        r.x >= outer.x
+            && r.y >= outer.y
+            && r.right() <= outer.right()
+            && r.bottom() <= outer.bottom()
+    }
+
+    #[test]
+    fn dashboard_normal_has_four_panes_and_stacked_bottom_rows() {
+        // Arrange
+        let inner = Rect::new(0, 0, 100, 30);
+
+        // Act
+        let a = dashboard_areas(inner, false);
+
+        // Assert: all optional panes present, no search bar.
+        let vis = a.queue.expect("queue present when wide/tall");
+        let detail = a.detail.expect("detail present when wide");
+        let footer = a.footer.expect("footer present when tall");
+        assert!(a.search_bar.is_none(), "no search bar when inactive");
+
+        // Upper panes are left/right neighbors on the same row.
+        assert_eq!(vis.x, a.now_playing.x + a.now_playing.width);
+        assert_eq!(vis.y, a.now_playing.y);
+        // Lower panes are left/right neighbors.
+        assert_eq!(detail.x, a.library.x + a.library.width);
+        assert_eq!(detail.y, a.library.y);
+        // Upper sits above lower.
+        assert!(a.now_playing.y < a.library.y);
+
+        // Bottom rows are each one line tall and stacked status → playbar → footer.
+        assert_eq!(a.status.height, 1);
+        assert_eq!(a.playbar.height, 1);
+        assert_eq!(footer.height, 1);
+        assert_eq!(a.playbar.y, a.status.y + 1);
+        assert_eq!(footer.y, a.playbar.y + 1);
+        // Footer is the bottom-most row.
+        assert_eq!(footer.bottom(), inner.bottom());
+    }
+
+    #[test]
+    fn dashboard_narrow_collapses_to_single_column() {
+        // Arrange
+        let inner = Rect::new(0, 0, 50, 30);
+
+        // Act
+        let a = dashboard_areas(inner, false);
+
+        // Assert
+        assert!(a.queue.is_none(), "no queue when narrow");
+        assert!(a.detail.is_none(), "no detail when narrow");
+        assert_eq!(a.now_playing.width, inner.width);
+        assert_eq!(a.library.width, inner.width);
+    }
+
+    #[test]
+    fn dashboard_short_drops_footer_before_queue() {
+        // Height 11: footer gone (< 12) but queue kept (>= 10).
+        let a = dashboard_areas(Rect::new(0, 0, 100, 11), false);
+        assert!(a.footer.is_none(), "footer dropped below 12 rows");
+        assert!(a.queue.is_some(), "queue kept at 11 rows");
+
+        // Height 9: both footer and queue gone (< 10).
+        let b = dashboard_areas(Rect::new(0, 0, 100, 9), false);
+        assert!(b.footer.is_none());
+        assert!(b.queue.is_none(), "queue dropped below 10 rows");
+    }
+
+    #[test]
+    fn dashboard_search_inserts_bar_between_upper_and_lower() {
+        // Arrange
+        let inner = Rect::new(0, 0, 100, 30);
+
+        // Act
+        let a = dashboard_areas(inner, true);
+
+        // Assert
+        let bar = a.search_bar.expect("search bar present when active");
+        assert_eq!(bar.height, 1);
+        assert!(a.now_playing.y < bar.y);
+        assert!(bar.y < a.library.y);
+    }
+
+    #[test]
+    fn dashboard_regions_stay_within_inner() {
+        let inner = Rect::new(3, 2, 100, 30);
+        let a = dashboard_areas(inner, true);
+        for r in [
+            Some(a.now_playing),
+            a.queue,
+            a.search_bar,
+            Some(a.library),
+            a.detail,
+            Some(a.status),
+            Some(a.playbar),
+            a.footer,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(within(inner, r), "region {r:?} escapes inner {inner:?}");
+        }
+    }
+
+    #[test]
+    fn dashboard_guarantees_status_then_playbar_on_tiny_heights() {
+        // Height 0 is degenerate: nothing can be drawn, so every row collapses to 0.
+        let a0 = dashboard_areas(Rect::new(0, 0, 100, 0), false);
+        assert_eq!(a0.status.height, 0, "no rows fit at height 0");
+        assert_eq!(a0.playbar.height, 0);
+
+        // From height 1 up, status must always survive (the only non-silent output); from height 2
+        // up, the playbar must too. Neither may overflow the inner area.
+        for h in 1..=4u16 {
+            let a = dashboard_areas(Rect::new(0, 0, 100, h), false);
+            assert!(a.status.height >= 1, "status must stay >= 1 at height {h}");
+            assert!(a.status.bottom() <= h, "status overflows at height {h}");
+            if h >= 2 {
+                assert!(
+                    a.playbar.height >= 1,
+                    "playbar must stay >= 1 at height {h}"
+                );
+                assert!(a.playbar.bottom() <= h, "playbar overflows at height {h}");
+            }
+        }
+    }
+
+    #[test]
+    fn dashboard_thresholds_are_inclusive_boundaries() {
+        // Width exactly at the two-column boundary keeps both columns; one below collapses.
+        let wide = dashboard_areas(Rect::new(0, 0, MIN_TWO_COL_WIDTH, 30), false);
+        assert!(wide.queue.is_some() && wide.detail.is_some());
+        let narrow = dashboard_areas(Rect::new(0, 0, MIN_TWO_COL_WIDTH - 1, 30), false);
+        assert!(narrow.queue.is_none() && narrow.detail.is_none());
+
+        // Height exactly at the footer threshold keeps the footer; one below drops it.
+        let with_footer = dashboard_areas(Rect::new(0, 0, 100, MIN_FOOTER_HEIGHT), false);
+        assert!(with_footer.footer.is_some());
+        let no_footer = dashboard_areas(Rect::new(0, 0, 100, MIN_FOOTER_HEIGHT - 1), false);
+        assert!(no_footer.footer.is_none());
+
+        // Height exactly at the queue threshold keeps it; one below drops it.
+        let with_vis = dashboard_areas(Rect::new(0, 0, 100, MIN_QUEUE_HEIGHT), false);
+        assert!(with_vis.queue.is_some());
+        let no_vis = dashboard_areas(Rect::new(0, 0, 100, MIN_QUEUE_HEIGHT - 1), false);
+        assert!(no_vis.queue.is_none());
+    }
+
+    #[test]
+    fn art_col_width_columnizes_only_when_wide_enough() {
+        // No art wanted (nothing playing) → no column.
+        assert_eq!(art_col_width(100, 20, false), 0);
+        // Wide and tall pane → capped at ART_COL_MAX (24) columns.
+        assert_eq!(art_col_width(100, 50, true), 24);
+        // Aspect-driven width (height*2) below the cap, bounded by half the pane width.
+        assert_eq!(art_col_width(40, 3, true), 6);
+        // Too narrow to host a >= ART_COL_MIN column → full-width text (0).
+        assert_eq!(art_col_width(6, 10, true), 0);
+    }
+
+    #[test]
+    fn art_col_width_lets_text_width_stay_positive() {
+        // Regression guard: the text width the caller derives (pane_w - art) must stay > 0 so
+        // render_lines truncates against the real text rectangle, not the whole pane.
+        let pane_w = 100u16;
+        let art = art_col_width(pane_w, 30, true);
+        assert!(
+            art > 0 && art < pane_w,
+            "art column must leave room for text"
+        );
+        assert!(pane_w - art > 0);
+    }
+
+    #[test]
+    fn stack_rows_allocates_from_top_and_drops_overflow() {
+        // Enough height: all rows fit, each one line tall, stacked top-down.
+        let full = stack_rows(Rect::new(0, 0, 10, 5), 5);
+        assert_eq!(full.len(), 5);
+        assert!(
+            full.iter()
+                .enumerate()
+                .all(|(i, r)| r.y == i as u16 && r.height == 1)
+        );
+        // Short area: only the top rows fit; lower (lower-priority) ones are dropped.
+        assert_eq!(stack_rows(Rect::new(0, 0, 10, 3), 5).len(), 3);
+        // Zero height: nothing fits.
+        assert!(stack_rows(Rect::new(2, 1, 10, 0), 5).is_empty());
+        // Respects the area offset.
+        let offset = stack_rows(Rect::new(3, 7, 10, 2), 5);
+        assert_eq!(offset.len(), 2);
+        assert_eq!((offset[0].x, offset[0].y), (3, 7));
+        assert_eq!(offset[1].y, 8);
+    }
+
+    #[test]
+    fn now_playing_rows_keep_top_priority_at_footer_boundary() {
+        // At the footer-threshold height the Now Playing pane is short, but its top rows
+        // (state / title / artist) must survive; only device/album may drop.
+        let a = dashboard_areas(Rect::new(0, 0, 100, MIN_FOOTER_HEIGHT), false);
+        let rows = stack_rows(a.now_playing, 5);
+        assert_eq!(
+            rows.len(),
+            4,
+            "state/title/artist/album survive, only device drops"
+        );
+        assert!(rows.iter().all(|r| r.height == 1), "no row is crushed to 0");
+        for pair in rows.windows(2) {
+            assert_eq!(pair[1].y, pair[0].y + 1, "rows stack contiguously");
+        }
+        // Rows stay inside the pane.
+        assert!(rows.iter().all(|r| within(a.now_playing, *r)));
+    }
+
+    #[test]
+    fn now_playing_rows_survive_tiny_pane_heights() {
+        // Sweep pane heights 1..=6: allocated row count == min(height, 5) and none is crushed.
+        for h in 1..=6u16 {
+            let pane = Rect::new(0, 0, 40, h);
+            let rows = stack_rows(pane, 5);
+            assert_eq!(rows.len() as u16, h.min(5), "row count at height {h}");
+            assert!(rows.iter().all(|r| r.height == 1), "no crush at height {h}");
+        }
+    }
 
     #[test]
     fn interpolate_advances_only_while_playing() {
@@ -269,6 +1022,164 @@ mod tests {
         assert_eq!(progress_ratio(250_000, 200_000), 1.0);
     }
 
+    // Column span of a progress bar: each glyph is one column, so char counts sum to the width.
+    fn bar_cols(b: &ProgressBar) -> usize {
+        b.filled.chars().count() + b.knob.chars().count() + b.track.chars().count()
+    }
+
+    #[test]
+    fn progress_bar_spans_exact_width() {
+        for (ratio, width) in [(0.0, 1), (0.5, 10), (1.0, 20), (0.3, 7)] {
+            assert_eq!(bar_cols(&progress_bar(ratio, width)), width);
+        }
+    }
+
+    #[test]
+    fn progress_bar_knob_moves_with_ratio() {
+        // Start: knob at the very left, nothing filled.
+        let start = progress_bar(0.0, 10);
+        assert_eq!(start.filled.chars().count(), 0);
+        assert_eq!(start.knob, theme::PROGRESS_KNOB);
+        // End: knob at the right, no unplayed track left.
+        let end = progress_bar(1.0, 10);
+        assert_eq!(end.filled.chars().count(), 9);
+        assert_eq!(end.track.chars().count(), 0);
+        // Middle (width 11 → 10 movable columns, half = 5 filled / 5 track).
+        let mid = progress_bar(0.5, 11);
+        assert_eq!(mid.filled.chars().count(), 5);
+        assert_eq!(mid.track.chars().count(), 5);
+    }
+
+    #[test]
+    fn progress_bar_zero_width_is_empty() {
+        let b = progress_bar(0.5, 0);
+        assert!(b.filled.is_empty() && b.knob.is_empty() && b.track.is_empty());
+    }
+
+    #[test]
+    fn progress_bar_clamps_out_of_range_ratio() {
+        // Above 1.0 clamps to the end (no track); below 0.0 clamps to the start (no fill).
+        assert_eq!(progress_bar(1.5, 5).track.chars().count(), 0);
+        assert_eq!(progress_bar(-0.5, 5).filled.chars().count(), 0);
+    }
+
+    #[test]
+    fn volume_bar_fills_by_percent() {
+        let b = volume_bar(Some(40), 5);
+        assert_eq!(b.filled.chars().count(), 2);
+        assert_eq!(b.empty.chars().count(), 3);
+        assert_eq!(b.label, "40%");
+    }
+
+    #[test]
+    fn volume_bar_full_and_empty() {
+        let full = volume_bar(Some(100), 5);
+        assert_eq!(full.filled.chars().count(), 5);
+        assert_eq!(full.empty.chars().count(), 0);
+        let zero = volume_bar(Some(0), 5);
+        assert_eq!(zero.filled.chars().count(), 0);
+        assert_eq!(zero.label, "0%");
+    }
+
+    #[test]
+    fn volume_bar_unknown_stays_visible() {
+        // An unavailable volume must render explicit empty blocks + a dash, never a blank.
+        let b = volume_bar(None, 5);
+        assert_eq!(b.filled.chars().count(), 0);
+        assert_eq!(b.empty.chars().count(), 5);
+        assert_eq!(b.label, "-");
+    }
+
+    #[test]
+    fn volume_bar_clamps_over_100() {
+        let b = volume_bar(Some(250), 5);
+        assert_eq!(b.filled.chars().count(), 5);
+        assert_eq!(b.label, "100%");
+    }
+
+    fn has_plain_containing(segs: &[PlaybarSeg], needle: &str) -> bool {
+        segs.iter()
+            .any(|s| matches!(s, PlaybarSeg::Plain(t) if t.contains(needle)))
+    }
+
+    fn has_knob(segs: &[PlaybarSeg]) -> bool {
+        segs.iter().any(|s| matches!(s, PlaybarSeg::Knob(_)))
+    }
+
+    #[test]
+    fn playbar_never_exceeds_width_and_keeps_volume() {
+        // Across a range of widths the rendered columns never overflow the area, and the volume
+        // percent label is always present (the "never silently clipped" invariant).
+        for width in [16, 20, 26, 28, 30, 40, 80] {
+            let segs = playbar_segments(width, true, 0.5, "1:23", "5:18", Some(40));
+            assert!(
+                playbar_width(&segs) <= width,
+                "playbar overflowed at width {width}: {} cols",
+                playbar_width(&segs)
+            );
+            assert!(
+                has_plain_containing(&segs, "40%"),
+                "volume label missing at width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn playbar_shows_slider_when_wide() {
+        let segs = playbar_segments(80, true, 0.5, "1:23", "5:18", Some(40));
+        assert!(has_knob(&segs), "wide playbar must draw the slider knob");
+        // A wide bar fills the full width exactly (slider is the flexible filler).
+        assert_eq!(playbar_width(&segs), 80);
+    }
+
+    #[test]
+    fn playbar_degrades_to_times_when_no_room_for_slider() {
+        // 28 cols: no room for a slider, but the `elapsed / total` text and volume still fit.
+        let segs = playbar_segments(28, true, 0.5, "1:23", "5:18", Some(40));
+        assert!(
+            !has_knob(&segs),
+            "no slider should be drawn when too narrow"
+        );
+        assert!(
+            has_plain_containing(&segs, "1:23 / 5:18"),
+            "times kept as text"
+        );
+        assert!(has_plain_containing(&segs, "40%"), "volume kept");
+    }
+
+    #[test]
+    fn playbar_never_overflows_at_tiny_widths() {
+        // At pathologically narrow widths the playbar must still never exceed its area (the value may
+        // be truncated, but the bar is never allowed to overflow and corrupt the row).
+        for width in [0, 5, 8, 10, 11, 12, 13, 14] {
+            let segs = playbar_segments(width, true, 0.5, "1:23", "5:18", Some(40));
+            assert!(
+                playbar_width(&segs) <= width,
+                "playbar overflowed at tiny width {width}: {} cols",
+                playbar_width(&segs)
+            );
+        }
+    }
+
+    #[test]
+    fn playbar_keeps_volume_when_it_fits() {
+        // Once the volume block fits (>= icon + volume width), the level is kept fully visible even
+        // though the times have been dropped.
+        let segs = playbar_segments(16, true, 0.5, "1:23", "5:18", Some(40));
+        assert!(playbar_width(&segs) <= 16);
+        assert!(has_plain_containing(&segs, "40%"), "volume must survive");
+    }
+
+    #[test]
+    fn playbar_unknown_volume_stays_visible() {
+        let segs = playbar_segments(80, false, 0.0, "-", "-", None);
+        // Unknown volume renders the dash label, never a blank.
+        assert!(
+            has_plain_containing(&segs, "-"),
+            "unknown volume shows a dash"
+        );
+    }
+
     fn sample(is_playing: bool) -> NowPlaying {
         NowPlaying {
             is_playing,
@@ -292,10 +1203,14 @@ mod tests {
         assert_eq!(out.state, format!("{} Playing", theme::PLAY));
         assert!(out.title.contains("Song"));
         assert!(out.artist.contains("Artist"));
-        assert_eq!(out.progress_label, "1:00 / 3:00");
+        assert!(out.is_playing);
+        assert_eq!(out.elapsed_label, "1:00");
+        assert_eq!(out.total_label, "3:00");
         assert_eq!(out.ratio, 60_000.0 / 180_000.0);
+        assert_eq!(out.volume, Some(40));
         assert!(out.device.contains("MacBook Pro"));
-        assert!(out.device.contains("40%"));
+        // Volume now lives on the playbar, not the device line.
+        assert!(!out.device.contains("40%"));
     }
 
     #[test]
@@ -325,7 +1240,21 @@ mod tests {
         let out = render_lines(None, 0, 80, None);
         assert_eq!(out.state, "Nothing is playing");
         assert!(out.artist.is_empty());
+        assert!(!out.is_playing);
         assert_eq!(out.ratio, 0.0);
+        assert_eq!(out.volume, None);
+        // Times must be a visible dash, never an empty string (no silent blank).
+        assert_eq!(out.elapsed_label, "-");
+        assert_eq!(out.total_label, "-");
+        // The hint must guide with real TUI keys, not a removed CLI command (issue #27).
+        assert!(
+            !out.title.contains("spotterm"),
+            "must not reference a removed CLI command"
+        );
+        assert!(
+            out.title.contains("/ to search") && out.title.contains("d to select"),
+            "should point to real TUI keys (search / device)"
+        );
     }
 
     #[test]
@@ -380,11 +1309,129 @@ mod tests {
     }
 
     #[test]
-    fn search_hint_varies_by_phase() {
-        assert!(search_hint(true, 0).contains("Enter to search"));
-        let results = search_hint(false, 3);
-        assert!(results.starts_with("3 results"));
-        assert!(results.contains("Enter play"));
+    fn search_tab_header_brackets_current_only() {
+        let out = search_tab_header(SearchTab::Top);
+        assert!(out.contains("[Top]"));
+        assert!(out.contains(" Songs "));
+        assert!(!out.contains("[Songs]"));
+        for tab in SearchTab::ALL {
+            assert!(out.contains(tab.label()), "missing {}", tab.label());
+        }
+    }
+
+    #[test]
+    fn library_tab_header_brackets_current_only() {
+        let out = library_tab_header(BrowseTab::All);
+        assert!(out.contains("[All]"));
+        assert!(out.contains(" Artists "));
+        assert!(!out.contains("[Artists]"));
+        // Every tab label appears exactly once.
+        for tab in BrowseTab::ALL {
+            assert!(out.contains(tab.label()));
+        }
+    }
+
+    #[test]
+    fn library_hint_reports_item_count() {
+        assert!(library_hint(7).starts_with("7 items"));
+        assert!(library_hint(7).contains("[ ] tab"));
+    }
+
+    #[test]
+    fn detail_row_right_aligns_duration_and_numbers() {
+        let out = detail_row(Some(4), "Weird Fishes", "Radiohead", 318_000, false, 40);
+        assert!(out.contains("4 Weird Fishes — Radiohead"));
+        assert!(out.trim_end().ends_with("5:18"));
+        // Fits within the pane width minus the 2-column selection marker.
+        assert!(crate::format::display_width(&out) <= 38);
+    }
+
+    #[test]
+    fn detail_row_marks_current_track_with_play_glyph() {
+        let out = detail_row(Some(1), "15 Step", "Radiohead", 237_000, true, 40);
+        assert!(out.starts_with(theme::PLAY));
+    }
+
+    #[test]
+    fn detail_row_without_track_number_omits_it() {
+        let out = detail_row(None, "Song", "", 60_000, false, 30);
+        assert!(out.starts_with("Song"));
+        assert!(out.trim_end().ends_with("1:00"));
+    }
+
+    #[test]
+    fn queue_row_marks_currently_playing_with_play_glyph() {
+        let out = queue_row(None, "15 Step", "Radiohead", 40);
+        assert!(out.starts_with(theme::PLAY));
+        assert!(out.contains("15 Step — Radiohead"));
+    }
+
+    #[test]
+    fn queue_row_numbers_upcoming_tracks() {
+        let out = queue_row(Some(3), "Nude", "Radiohead", 40);
+        assert_eq!(out, "3. Nude — Radiohead");
+    }
+
+    #[test]
+    fn queue_row_omits_dash_when_no_artists() {
+        let out = queue_row(Some(1), "Interlude", "", 40);
+        assert_eq!(out, "1. Interlude");
+    }
+
+    #[test]
+    fn queue_row_truncates_to_width() {
+        let out = queue_row(Some(1), "abcdefghijklmnop", "", 8);
+        assert!(crate::format::display_width(&out) <= 8);
+    }
+
+    #[test]
+    fn queue_hint_reports_upcoming_count() {
+        assert_eq!(queue_hint(5), "5 up next");
+    }
+
+    #[test]
+    fn queue_became_visible_true_only_on_hidden_to_visible() {
+        assert!(queue_became_visible(false, true));
+        assert!(!queue_became_visible(true, true));
+        assert!(!queue_became_visible(false, false));
+        assert!(!queue_became_visible(true, false));
+    }
+
+    #[test]
+    fn detail_hint_reports_track_count() {
+        assert!(detail_hint(12).starts_with("12 tracks"));
+        assert!(detail_hint(12).contains("Enter play"));
+    }
+
+    #[test]
+    fn detail_error_403_reads_as_restricted_not_failure() {
+        let msg = detail_error_message(Some(403), "artist top tracks");
+        assert!(msg.contains("artist top tracks"));
+        assert!(msg.contains("restricted"));
+        assert!(msg.contains("403"));
+        // Framed as a limitation, not a scary failure.
+        assert!(!msg.contains("failed"));
+    }
+
+    #[test]
+    fn detail_error_404_reports_not_found() {
+        assert_eq!(
+            detail_error_message(Some(404), "playlist tracks"),
+            "playlist tracks not found (404)"
+        );
+    }
+
+    #[test]
+    fn detail_error_other_status_shows_code() {
+        assert_eq!(
+            detail_error_message(Some(500), "album tracks"),
+            "failed to load album tracks (HTTP 500)"
+        );
+    }
+
+    #[test]
+    fn detail_error_no_status_is_generic() {
+        assert_eq!(detail_error_message(None, "track"), "failed to load track");
     }
 
     #[test]
@@ -419,6 +1466,33 @@ mod tests {
     }
 
     #[test]
+    fn focus_next_swaps_lower_panes_when_detail_visible() {
+        assert_eq!(Focus::Library.next(true), Focus::Detail);
+        assert_eq!(Focus::Detail.next(true), Focus::Library);
+    }
+
+    #[test]
+    fn focus_next_stays_on_library_when_detail_hidden() {
+        // Narrow terminal: only one navigable pane, so tab clamps focus at navigation time (no
+        // hidden drift that would surface as a focus "jump" after the terminal is widened again).
+        assert_eq!(Focus::Library.next(false), Focus::Library);
+        assert_eq!(Focus::Detail.next(false), Focus::Library);
+    }
+
+    #[test]
+    fn focus_effective_clamps_to_library_when_detail_hidden() {
+        // A narrow terminal hides the detail pane, so focus must never rest on it.
+        assert_eq!(Focus::Detail.effective(false), Focus::Library);
+        assert_eq!(Focus::Library.effective(false), Focus::Library);
+    }
+
+    #[test]
+    fn focus_effective_keeps_stored_when_detail_visible() {
+        assert_eq!(Focus::Detail.effective(true), Focus::Detail);
+        assert_eq!(Focus::Library.effective(true), Focus::Library);
+    }
+
+    #[test]
     fn help_entries_cover_all_keys() {
         let keys: Vec<&str> = help_entries().iter().map(|(k, _)| *k).collect();
         for k in [
@@ -428,7 +1502,10 @@ mod tests {
             "+ / -",
             "s",
             "/",
-            "2",
+            "tab",
+            "[ / ]",
+            "↑ / ↓",
+            "enter",
             "d",
             "r",
             "?",

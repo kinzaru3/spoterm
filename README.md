@@ -91,6 +91,11 @@ spotterm tui     # launch the interactive Now Playing dashboard
 
 Everything — playback, search, library browsing, device switching — happens inside the TUI.
 
+> **Upgrading from an older version?** The library's **Artists** tab (followed artists) needs the
+> `user-follow-read` scope, added in the dashboard redesign. Existing tokens lack it, so run
+> `spotterm login` once more to grant it — until you do, the Artists tab shows a fetch error (it is
+> never silently blank).
+
 ### Interactive TUI
 
 ```sh
@@ -105,9 +110,12 @@ spotterm tui
 | `+` / `-` | volume ±5 |
 | `s` | save / unsave the current track |
 | `/` | search and play |
-| `2` | browse library (playlists / saved tracks / albums) |
+| `tab` | move focus between the library and detail panes |
+| `[` / `]` | library: previous / next tab (All / Artists / Albums / Playlists / Tracks) |
+| `↑` / `↓` | move the selection in the focused pane (library / detail) |
+| `enter` | play the selection (library item, or a track from the detail pane) |
 | `d` | device picker (transfer playback) |
-| `r` | refresh |
+| `r` | refresh (playback, and the focused library tab or detail pane) |
 | `?` | help |
 | `q` / `Esc` / `Ctrl-C` | quit |
 
