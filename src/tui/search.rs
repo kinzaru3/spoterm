@@ -472,6 +472,10 @@ enum SearchPlay {
 /// Play the current search selection. Reports on the always-visible status line (search shares the
 /// dashboard, which draws `app.status`). A header/empty selection plays nothing.
 async fn search_play(app: &mut App) {
+    // This entry bypasses `ensure_ready`, so gate it on the 429 cooldown directly (shows the countdown).
+    if super::rate_limit_blocked(app) {
+        return;
+    }
     // Build the play plan under the borrow, then drop it before the async playback re-borrows app.
     let plan = {
         let super::Mode::Search(state) = &app.mode else {
@@ -513,7 +517,9 @@ async fn search_play(app: &mut App) {
             app.last_poll = None; // Reflect playback start on screen quickly.
         }
         Err(e) => {
-            app.status = format!("{} playback failed: {e:#}", theme::WARN);
+            if !super::note_if_rate_limited(app, &e) {
+                app.status = format!("{} playback failed: {e:#}", theme::WARN);
+            }
         }
     }
 }
@@ -579,6 +585,10 @@ pub(super) async fn ensure_search_detail_loaded(app: &mut App) {
             if let Some(state) = search_state_mut(app) {
                 state.detail.set(key, data);
             }
+        }
+        Err(e) if super::note_if_rate_limited(app, &e) => {
+            // A 429 armed the cooldown (countdown on the status line); leave the last-known detail in
+            // place — the highlight detail re-loads once the cooldown lifts.
         }
         Err(e) => {
             let msg = format!("{e:#}");

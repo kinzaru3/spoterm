@@ -9,7 +9,6 @@
 use anyhow::{Context, Result};
 use rspotify::AuthCodePkceSpotify;
 use rspotify::ClientError;
-use rspotify::http::HttpError;
 use rspotify::model::{
     AlbumId, ArtistId, Market, PlayableItem, PlaylistId, SimplifiedArtist, SimplifiedTrack, TrackId,
 };
@@ -220,18 +219,6 @@ pub async fn fetch(
     }
 }
 
-/// The HTTP status of a client error, when the failure was an HTTP response (rather than a transport
-/// or parse error). Used to distinguish Spotify's `403` content restrictions from real failures.
-fn http_status(err: &ClientError) -> Option<u16> {
-    match err {
-        ClientError::Http(http) => match http.as_ref() {
-            HttpError::StatusCode(resp) => Some(resp.status().as_u16()),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
 /// Wrap a failed fetch with a concise, user-facing lead message (via [`view::detail_error_message`],
 /// which frames Spotify's `403` content restrictions as an expected limitation), keeping the original
 /// error as the cause. The caller renders the chain with `{e:#}`, so the friendly lead shows first and
@@ -239,7 +226,7 @@ fn http_status(err: &ClientError) -> Option<u16> {
 /// error: status code 403 Forbidden"), not the raw `Debug` dump. Non-mapped failures in `fetch` (token
 /// refresh, URI parse) keep their own context chain and are unaffected. `what` is the content label.
 fn fetch_err(what: &str, err: ClientError) -> anyhow::Error {
-    let msg = view::detail_error_message(http_status(&err), what);
+    let msg = view::detail_error_message(super::rate_limit::http_status(&err), what);
     anyhow::Error::new(err).context(msg)
 }
 
@@ -340,6 +327,10 @@ pub(super) async fn ensure_detail_loaded(app: &mut App) {
             app.detail_cache.insert(key.clone(), data.clone());
             app.detail.set(key, data);
         }
+        Err(e) if super::note_if_rate_limited(app, &e) => {
+            // A 429 armed the cooldown (countdown on the status line); do not stamp a fetch error on
+            // the pane — the load simply retries once the cooldown lifts.
+        }
         Err(e) => {
             // Surface the full cause chain (`{e:#}`): `detail::fetch_err` leads with a concise,
             // user-facing message and keeps the underlying error for diagnosis; non-mapped failures
@@ -354,6 +345,10 @@ pub(super) async fn ensure_detail_loaded(app: &mut App) {
 /// Play the detail track list as a queue, starting at the selected row, so `next`/`prev` walk the
 /// list (the same all-URIs-queued invariant as search). Reports on the always-visible status line.
 pub(super) async fn detail_play(app: &mut App) {
+    // This entry bypasses `ensure_ready`, so gate it on the 429 cooldown directly (shows the countdown).
+    if super::rate_limit_blocked(app) {
+        return;
+    }
     let uris: Vec<String> = app.detail.rows.iter().map(|r| r.uri.clone()).collect();
     if uris.is_empty() {
         return;
@@ -365,7 +360,9 @@ pub(super) async fn detail_play(app: &mut App) {
             app.last_poll = None;
         }
         Err(e) => {
-            app.status = format!("{} playback failed: {e:#}", theme::WARN);
+            if !super::note_if_rate_limited(app, &e) {
+                app.status = format!("{} playback failed: {e:#}", theme::WARN);
+            }
         }
     }
 }
