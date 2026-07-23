@@ -67,6 +67,7 @@ pub(super) async fn poll_playback(app: &mut App) {
             }
             app.now = Some(np);
             app.poll_failures = 0;
+            super::clear_rate_limit(app); // a successful poll ends any 429 cooldown
             // On recovery, clear only if what remains is a stale ⚠ warning (do not clear a
             // legitimate message from the user's last operation, i.e. Ok/Info).
             if was_failing && view::status_kind(&app.status) == view::StatusKind::Warn {
@@ -82,11 +83,17 @@ pub(super) async fn poll_playback(app: &mut App) {
             app.art = None;
             app.art_url = None;
             app.poll_failures = 0;
+            super::clear_rate_limit(app); // a successful poll ends any 429 cooldown
             if was_failing && view::status_kind(&app.status) == view::StatusKind::Warn {
                 app.status.clear();
             }
         }
         Err(e) => {
+            // A 429 is a transient rate limit, not a poll failure: arm the cooldown (which gates the
+            // next polls) and leave `poll_failures` untouched so auto-refresh is never stopped by it.
+            if super::note_if_rate_limited(app, &e) {
+                return;
+            }
             app.poll_failures = app.poll_failures.saturating_add(1);
             app.status = if app.poll_failures >= MAX_POLL_FAILURES {
                 format!(
@@ -248,8 +255,13 @@ async fn refresh_saved(app: &mut App) {
     }
     // Regardless of success, stop re-querying for this track (best-effort).
     app.saved_checked = true;
-    if let Ok(mut flags) = app.client.library_contains([LibraryId::Track(id)]).await {
-        app.saved = flags.pop();
+    match app.client.library_contains([LibraryId::Track(id)]).await {
+        Ok(mut flags) => app.saved = flags.pop(),
+        // Stay best-effort for ordinary failures (the marker just does not appear), but still let a
+        // 429 arm the shared cooldown so this per-track probe cannot quietly keep feeding a burst.
+        Err(e) => {
+            super::note_if_rate_limited_client(app, &e);
+        }
     }
 }
 
@@ -307,10 +319,12 @@ pub(super) async fn control_seek(app: &mut App, delta_ms: i64) {
             app.status = format!("{} Seek {}", theme::SEEK, crate::format::format_ms(target));
         }
         Err(e) => {
-            app.status = format!(
-                "{} seek failed: {e} (press d to select and activate a device)",
-                theme::WARN
-            );
+            if !super::note_if_rate_limited_client(app, &e) {
+                app.status = format!(
+                    "{} seek failed: {e} (press d to select and activate a device)",
+                    theme::WARN
+                );
+            }
         }
     }
 }
@@ -352,7 +366,9 @@ pub(super) async fn control_save(app: &mut App) {
             };
         }
         Err(e) => {
-            app.status = format!("{} save operation failed: {e}", theme::WARN);
+            if !super::note_if_rate_limited_client(app, &e) {
+                app.status = format!("{} save operation failed: {e}", theme::WARN);
+            }
         }
     }
 }
