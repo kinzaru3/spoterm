@@ -720,6 +720,13 @@ pub fn dashboard_areas(inner: Rect, search_active: bool) -> DashboardAreas {
     }
 }
 
+/// True on a hidden→visible transition of the queue pane (#38), so the caller can force an
+/// immediate re-poll and not leave the pane stuck on "Loading…" for up to one poll interval. Pure so
+/// the "poll right after it reappears" rule is unit-tested without driving the loop.
+pub fn queue_became_visible(prev: bool, now: bool) -> bool {
+    now && !prev
+}
+
 /// Cover-art columns are square; terminal cells are about twice as tall as wide, so a column of
 /// `height * 2` columns renders roughly square.
 const ART_COL_ASPECT: u16 = 2;
@@ -1380,6 +1387,14 @@ mod tests {
     #[test]
     fn queue_hint_reports_upcoming_count() {
         assert_eq!(queue_hint(5), "5 up next");
+    }
+
+    #[test]
+    fn queue_became_visible_true_only_on_hidden_to_visible() {
+        assert!(queue_became_visible(false, true));
+        assert!(!queue_became_visible(true, true));
+        assert!(!queue_became_visible(false, false));
+        assert!(!queue_became_visible(true, false));
     }
 
     #[test]

@@ -116,6 +116,13 @@ struct App {
     /// by the `tab` handler so focus navigation clamps to the panes actually on screen; updated by
     /// `draw_dashboard`. Starts `false` — the first draw sets it before any key can be handled.
     detail_visible: bool,
+    /// Whether the queue pane was visible in the most recent draw (false on narrow/short terminals,
+    /// where `dashboard_areas` drops it). Gates `poll_queue` so a terminal too small to show the
+    /// queue does not spend a `current_user_queue()` call every poll (#38). Reset to `false` at the
+    /// start of every `draw` and set back to its real value only by `draw_dashboard`, so full-screen
+    /// overlays (Devices/Help) that never draw the pane also stop its poll. Starts `false` — the
+    /// first draw sets it before any poll gating reads it.
+    queue_visible: bool,
     /// Per-tab fetch-result cache for the library pane (avoids re-fetching on tab switch).
     browse_cache: browse::BrowseCache,
     /// The always-visible library pane state (current tab, rows, selection, message).
@@ -182,6 +189,7 @@ async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify, picker: Pick
         mode: Mode::Normal,
         focus: view::Focus::Library,
         detail_visible: false,
+        queue_visible: false,
         browse_cache: browse::BrowseCache::default(),
         library: browse::LibraryState::default(),
         library_loaded: false,
@@ -205,6 +213,10 @@ async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify, picker: Pick
     // For auto-clearing the status line (detect changes and time them. Not stored on App; handled within this loop).
     let mut last_status = app.status.clone();
     let mut status_since = Instant::now();
+    // Queue-pane visibility as of the previous draw. When it flips hidden→visible we force an
+    // immediate poll so the reappearing pane is not stuck on "Loading…" for a poll interval (#38).
+    // Loop-local like `last_status`; starts `false` to match `App.queue_visible`'s initial value.
+    let mut prev_queue_visible = false;
 
     loop {
         // When `last_poll` is None, force a poll (right after startup, after an operation, or `r`). A
@@ -214,7 +226,15 @@ async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify, picker: Pick
         let timer_due = app.last_poll.is_none_or(|t| t.elapsed() >= POLL_INTERVAL);
         if forced || (timer_due && app.poll_failures < MAX_POLL_FAILURES) {
             playback::poll_playback(&mut app).await;
-            queue::poll_queue(&mut app).await;
+            // Poll the queue only while its pane is on screen (#38), reading the *previous* frame's
+            // visibility (this poll runs before this iteration's `draw`). A hidden→visible flip is
+            // caught after the draw below and forces a re-poll, so the one-frame lag is bounded by
+            // `TICK`, not `POLL_INTERVAL`. `poll_playback` stays unconditional (Now Playing / playbar
+            // are always shown). Sequential, not `join!`ed: `ensure_fresh_token` assumes single-task
+            // ordering, so we only thin the cadence.
+            if app.queue_visible {
+                queue::poll_queue(&mut app).await;
+            }
             app.last_poll = Some(Instant::now());
         }
 
@@ -234,6 +254,17 @@ async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify, picker: Pick
         }
 
         terminal.draw(|frame| draw(frame, &mut app))?;
+
+        // `draw` refreshed `app.queue_visible`. If the queue pane just reappeared (terminal widened
+        // or grew tall enough, or an overlay closed), force an immediate poll so it does not sit on
+        // "Loading…" for up to a poll interval (#38). Compared against the previous draw's value;
+        // both start `false`. The pane this frame shows the last-known `QueueState` (like the
+        // library/detail caches do); the forced re-poll refreshes it on the next iteration (≤ TICK),
+        // so the momentary stale row is bounded and self-heals rather than flashing a spinner.
+        if view::queue_became_visible(prev_queue_visible, app.queue_visible) {
+            app.last_poll = None;
+        }
+        prev_queue_visible = app.queue_visible;
 
         // Load the library once, *after* the first frame is drawn, so the dashboard (with the
         // "Loading…" library note) appears immediately instead of the whole UI blocking on the
@@ -414,6 +445,11 @@ fn install_panic_hook() {
 // ---- Rendering --------------------------------------------------------------
 
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
+    // Default the queue pane to hidden each frame; only `draw_dashboard` (Normal/Search) sets it back
+    // to its real visibility. This keeps `queue_visible` meaning "the queue pane was drawn in the
+    // last frame", so full-screen overlays (Devices `d` / Help `?`) correctly stop the queue poll —
+    // the pane is not on screen there, so we must not spend a `current_user_queue()` call for it (#38).
+    app.queue_visible = false;
     // Branch on ModeKind (Copy) to release the borrow immediately. Normal needs `&mut app` for image rendering.
     match app.mode.kind() {
         // Search shares the dashboard shell (Now Playing / playbar / footer); it only swaps the lower
@@ -516,6 +552,10 @@ fn draw_dashboard(frame: &mut ratatui::Frame, app: &mut App) {
     // Record it so the `tab` key handler (which has no access to the frame size) can clamp focus
     // navigation to the panes actually on screen.
     app.detail_visible = detail_visible;
+    // Record queue-pane visibility on the same cadence (#38): the poll loop reads it to skip the
+    // `current_user_queue()` call when the pane is off-screen. Mode-independent — the queue pane is
+    // drawn in both Normal and Search — so `areas.queue.is_some()` is the sole source of truth.
+    app.queue_visible = areas.queue.is_some();
     // In search mode the focused pane comes from the search state; otherwise from `app.focus`.
     let focus = search_focus.unwrap_or(app.focus).effective(detail_visible);
     if let Some(queue_area) = areas.queue {
