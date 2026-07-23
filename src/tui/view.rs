@@ -58,6 +58,179 @@ pub fn progress_ratio(progress_ms: u128, duration_ms: u128) -> f64 {
     (progress_ms as f64 / duration_ms as f64).clamp(0.0, 1.0)
 }
 
+/// A progress slider split into its three segments so the layout math stays pure and unit-testable
+/// while the draw layer only assigns colors. Each glyph is one column wide, so
+/// `filled + knob + track` spans exactly `width` columns (`width == 0` yields all-empty, no knob).
+pub struct ProgressBar {
+    pub filled: String,
+    pub knob: String,
+    pub track: String,
+}
+
+/// Build a `▬▬▬●─────` progress slider `width` columns wide from a `ratio` (clamped to 0.0..=1.0).
+/// The knob marks the current position: everything left of it is filled, everything right is the
+/// unplayed track. `width == 0` returns empty segments (nothing to draw).
+pub fn progress_bar(ratio: f64, width: usize) -> ProgressBar {
+    if width == 0 {
+        return ProgressBar {
+            filled: String::new(),
+            knob: String::new(),
+            track: String::new(),
+        };
+    }
+    // One column is always the knob; the remaining `last` columns are split filled/track.
+    let last = width - 1;
+    let pos = (ratio.clamp(0.0, 1.0) * last as f64).round() as usize;
+    let pos = pos.min(last);
+    ProgressBar {
+        filled: theme::PROGRESS_FILLED.repeat(pos),
+        knob: theme::PROGRESS_KNOB.to_string(),
+        track: theme::PROGRESS_TRACK.repeat(last - pos),
+    }
+}
+
+/// A volume bar split into filled/empty segments plus a numeric percent label, so the draw layer can
+/// color the filled part. `segments` is the block count. An unknown volume (`None`) renders all-empty
+/// blocks with a `-` label (never silently blank) so an unavailable device stays visible.
+pub struct VolumeBar {
+    pub filled: String,
+    pub empty: String,
+    pub label: String,
+}
+
+/// Format a `▮▮▯▯▯ 40%` volume bar with `segments` blocks. The percent is clamped to 0..=100 and the
+/// filled block count is rounded to the nearest segment.
+pub fn volume_bar(volume: Option<u8>, segments: usize) -> VolumeBar {
+    match volume {
+        Some(v) => {
+            let v = (v as usize).min(100);
+            let filled = ((v * segments + 50) / 100).min(segments);
+            VolumeBar {
+                filled: theme::VOL_FILLED.repeat(filled),
+                empty: theme::VOL_EMPTY.repeat(segments - filled),
+                label: format!("{v}%"),
+            }
+        }
+        None => VolumeBar {
+            filled: String::new(),
+            empty: theme::VOL_EMPTY.repeat(segments),
+            label: "-".to_string(),
+        },
+    }
+}
+
+/// Number of blocks in the playbar's volume bar.
+pub const VOL_SEGMENTS: usize = 5;
+/// Minimum slider width worth drawing; below this the playbar drops the slider (keeping the times).
+const MIN_SLIDER_WIDTH: usize = 3;
+/// Spacing between the time block and the volume block.
+const PLAYBAR_GAP: usize = 3;
+
+/// One styled piece of the bottom playbar. Kept free of ratatui so the whole layout (including the
+/// narrow-terminal degrade) is a pure, testable function; the draw layer maps each variant to a color.
+pub enum PlaybarSeg {
+    /// Accent (green): the play/pause glyph and the filled progress/volume blocks.
+    Accent(String),
+    /// The progress knob (green, emphasized).
+    Knob(String),
+    /// Dim: the unplayed progress track and the empty volume blocks.
+    Track(String),
+    /// Default color: time labels, gaps, the volume icon and its percent label.
+    Plain(String),
+}
+
+/// Total column width of a segment list (each glyph is one column). A test-only invariant check that
+/// the playbar never exceeds its area width.
+#[cfg(test)]
+pub fn playbar_width(segs: &[PlaybarSeg]) -> usize {
+    segs.iter()
+        .map(|s| match s {
+            PlaybarSeg::Accent(t)
+            | PlaybarSeg::Knob(t)
+            | PlaybarSeg::Track(t)
+            | PlaybarSeg::Plain(t) => display_width(t),
+        })
+        .sum()
+}
+
+/// Build the bottom playbar as styled segments that fit within `width` columns:
+/// `{▶|⏸} {elapsed} {▬▬●───} {total}   {🔊} {▮▮▯▯▯} {40%}`. The slider is the flexible filler; when
+/// the terminal is too narrow for it (`< MIN_SLIDER_WIDTH`) the slider is dropped in favor of
+/// `elapsed / total` text, and when even that will not fit the times are dropped too — but the volume
+/// block is always kept (never silently clipped), honoring the "no silent failure" invariant.
+pub fn playbar_segments(
+    width: usize,
+    is_playing: bool,
+    ratio: f64,
+    elapsed: &str,
+    total: &str,
+    volume: Option<u8>,
+) -> Vec<PlaybarSeg> {
+    let icon = if is_playing {
+        theme::PLAY
+    } else {
+        theme::PAUSE
+    };
+    let vb = volume_bar(volume, VOL_SEGMENTS);
+
+    // The volume block is kept at all costs; append it to `segs` as the rightmost pieces.
+    let push_volume = |segs: &mut Vec<PlaybarSeg>| {
+        segs.push(PlaybarSeg::Plain(format!("{} ", theme::VOLUME)));
+        segs.push(PlaybarSeg::Accent(vb.filled.clone()));
+        segs.push(PlaybarSeg::Track(vb.empty.clone()));
+        segs.push(PlaybarSeg::Plain(format!(" {}", vb.label)));
+    };
+    let icon_w = display_width(icon) + 1; // "{icon} "
+    let vol_w = display_width(theme::VOLUME) + 1 + VOL_SEGMENTS + 1 + display_width(&vb.label);
+
+    let mut segs = vec![PlaybarSeg::Accent(format!("{icon} "))];
+
+    // Full layout: fill the leftover width with the slider.
+    let elapsed_w = display_width(elapsed) + 1; // "{elapsed} "
+    let total_w = 1 + display_width(total) + PLAYBAR_GAP; // " {total}   "
+    let full_fixed = icon_w + elapsed_w + total_w + vol_w;
+    let slider = width.saturating_sub(full_fixed);
+    if slider >= MIN_SLIDER_WIDTH {
+        let pb = progress_bar(ratio, slider);
+        segs.push(PlaybarSeg::Plain(format!("{elapsed} ")));
+        segs.push(PlaybarSeg::Accent(pb.filled));
+        segs.push(PlaybarSeg::Knob(pb.knob));
+        segs.push(PlaybarSeg::Track(pb.track));
+        segs.push(PlaybarSeg::Plain(format!(
+            " {total}{}",
+            " ".repeat(PLAYBAR_GAP)
+        )));
+        push_volume(&mut segs);
+        return segs;
+    }
+
+    // Too narrow for a slider: show the times as `elapsed / total` if they still fit alongside volume.
+    let mid = format!("{elapsed} / {total}{}", " ".repeat(PLAYBAR_GAP));
+    if icon_w + display_width(&mid) + vol_w <= width {
+        segs.push(PlaybarSeg::Plain(mid));
+        push_volume(&mut segs);
+        return segs;
+    }
+
+    // Even the times will not fit: drop them but keep the volume block. Keep it colored while it
+    // fits; on a pathologically narrow terminal fall back to a single truncated plain piece so the
+    // bar never overflows for *any* width (`truncate` guarantees `display_width <= width`).
+    if icon_w + vol_w <= width {
+        push_volume(&mut segs);
+        return segs;
+    }
+    segs.clear();
+    let compact = format!(
+        "{icon} {} {}{} {}",
+        theme::VOLUME,
+        vb.filled,
+        vb.empty,
+        vb.label
+    );
+    segs.push(PlaybarSeg::Plain(truncate(&compact, width)));
+    segs
+}
+
 /// The lines needed for rendering (primitive strings + progress ratio). Kept independent of
 /// ratatui so the render logic is a pure function and unit testable (`mod.rs::draw` just feeds
 /// these into widgets).
@@ -66,8 +239,14 @@ pub struct RenderLines {
     pub title: String,
     pub artist: String,
     pub album: String,
+    /// Whether playback is active — selects the play/pause glyph on the bottom playbar.
+    pub is_playing: bool,
     pub ratio: f64,
-    pub progress_label: String,
+    /// Elapsed / total time labels for the playbar (e.g. `"1:23"` / `"5:18"`; `"-"` when idle).
+    pub elapsed_label: String,
+    pub total_label: String,
+    /// Current device volume 0..=100, or `None` when unknown. Rendered as the playbar's volume bar.
+    pub volume: Option<u8>,
     pub device: String,
 }
 
@@ -103,8 +282,11 @@ pub fn render_lines(
             title: "  (press / to search, 2 to browse, d to select a device)".to_string(),
             artist: String::new(),
             album: String::new(),
+            is_playing: false,
             ratio: 0.0,
-            progress_label: "-".to_string(),
+            elapsed_label: "-".to_string(),
+            total_label: "-".to_string(),
+            volume: None,
             device: String::new(),
         };
     };
@@ -115,10 +297,6 @@ pub fn render_lines(
     } else {
         format!("{} Paused", theme::PAUSE)
     };
-    let vol = n
-        .volume
-        .map(|v| format!("{v}%"))
-        .unwrap_or_else(|| "-".to_string());
 
     RenderLines {
         state: format!("{head}{}", saved_marker(saved)),
@@ -129,9 +307,13 @@ pub fn render_lines(
             .as_deref()
             .map(|a| line(&format!("{} ", theme::ALBUM), a))
             .unwrap_or_default(),
+        is_playing: n.is_playing,
         ratio: progress_ratio(prog, n.duration_ms),
-        progress_label: format!("{} / {}", format_ms(prog), format_ms(n.duration_ms)),
-        device: format!("{} {} (vol {vol})", theme::VOLUME, n.device),
+        elapsed_label: format_ms(prog),
+        total_label: format_ms(n.duration_ms),
+        volume: n.volume,
+        // Volume moved to the playbar's volume bar (issue #26 Phase 6); the device line is name-only.
+        device: format!("{} {}", theme::VOLUME, n.device),
     }
 }
 
@@ -809,6 +991,164 @@ mod tests {
         assert_eq!(progress_ratio(250_000, 200_000), 1.0);
     }
 
+    // Column span of a progress bar: each glyph is one column, so char counts sum to the width.
+    fn bar_cols(b: &ProgressBar) -> usize {
+        b.filled.chars().count() + b.knob.chars().count() + b.track.chars().count()
+    }
+
+    #[test]
+    fn progress_bar_spans_exact_width() {
+        for (ratio, width) in [(0.0, 1), (0.5, 10), (1.0, 20), (0.3, 7)] {
+            assert_eq!(bar_cols(&progress_bar(ratio, width)), width);
+        }
+    }
+
+    #[test]
+    fn progress_bar_knob_moves_with_ratio() {
+        // Start: knob at the very left, nothing filled.
+        let start = progress_bar(0.0, 10);
+        assert_eq!(start.filled.chars().count(), 0);
+        assert_eq!(start.knob, theme::PROGRESS_KNOB);
+        // End: knob at the right, no unplayed track left.
+        let end = progress_bar(1.0, 10);
+        assert_eq!(end.filled.chars().count(), 9);
+        assert_eq!(end.track.chars().count(), 0);
+        // Middle (width 11 → 10 movable columns, half = 5 filled / 5 track).
+        let mid = progress_bar(0.5, 11);
+        assert_eq!(mid.filled.chars().count(), 5);
+        assert_eq!(mid.track.chars().count(), 5);
+    }
+
+    #[test]
+    fn progress_bar_zero_width_is_empty() {
+        let b = progress_bar(0.5, 0);
+        assert!(b.filled.is_empty() && b.knob.is_empty() && b.track.is_empty());
+    }
+
+    #[test]
+    fn progress_bar_clamps_out_of_range_ratio() {
+        // Above 1.0 clamps to the end (no track); below 0.0 clamps to the start (no fill).
+        assert_eq!(progress_bar(1.5, 5).track.chars().count(), 0);
+        assert_eq!(progress_bar(-0.5, 5).filled.chars().count(), 0);
+    }
+
+    #[test]
+    fn volume_bar_fills_by_percent() {
+        let b = volume_bar(Some(40), 5);
+        assert_eq!(b.filled.chars().count(), 2);
+        assert_eq!(b.empty.chars().count(), 3);
+        assert_eq!(b.label, "40%");
+    }
+
+    #[test]
+    fn volume_bar_full_and_empty() {
+        let full = volume_bar(Some(100), 5);
+        assert_eq!(full.filled.chars().count(), 5);
+        assert_eq!(full.empty.chars().count(), 0);
+        let zero = volume_bar(Some(0), 5);
+        assert_eq!(zero.filled.chars().count(), 0);
+        assert_eq!(zero.label, "0%");
+    }
+
+    #[test]
+    fn volume_bar_unknown_stays_visible() {
+        // An unavailable volume must render explicit empty blocks + a dash, never a blank.
+        let b = volume_bar(None, 5);
+        assert_eq!(b.filled.chars().count(), 0);
+        assert_eq!(b.empty.chars().count(), 5);
+        assert_eq!(b.label, "-");
+    }
+
+    #[test]
+    fn volume_bar_clamps_over_100() {
+        let b = volume_bar(Some(250), 5);
+        assert_eq!(b.filled.chars().count(), 5);
+        assert_eq!(b.label, "100%");
+    }
+
+    fn has_plain_containing(segs: &[PlaybarSeg], needle: &str) -> bool {
+        segs.iter()
+            .any(|s| matches!(s, PlaybarSeg::Plain(t) if t.contains(needle)))
+    }
+
+    fn has_knob(segs: &[PlaybarSeg]) -> bool {
+        segs.iter().any(|s| matches!(s, PlaybarSeg::Knob(_)))
+    }
+
+    #[test]
+    fn playbar_never_exceeds_width_and_keeps_volume() {
+        // Across a range of widths the rendered columns never overflow the area, and the volume
+        // percent label is always present (the "never silently clipped" invariant).
+        for width in [16, 20, 26, 28, 30, 40, 80] {
+            let segs = playbar_segments(width, true, 0.5, "1:23", "5:18", Some(40));
+            assert!(
+                playbar_width(&segs) <= width,
+                "playbar overflowed at width {width}: {} cols",
+                playbar_width(&segs)
+            );
+            assert!(
+                has_plain_containing(&segs, "40%"),
+                "volume label missing at width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn playbar_shows_slider_when_wide() {
+        let segs = playbar_segments(80, true, 0.5, "1:23", "5:18", Some(40));
+        assert!(has_knob(&segs), "wide playbar must draw the slider knob");
+        // A wide bar fills the full width exactly (slider is the flexible filler).
+        assert_eq!(playbar_width(&segs), 80);
+    }
+
+    #[test]
+    fn playbar_degrades_to_times_when_no_room_for_slider() {
+        // 28 cols: no room for a slider, but the `elapsed / total` text and volume still fit.
+        let segs = playbar_segments(28, true, 0.5, "1:23", "5:18", Some(40));
+        assert!(
+            !has_knob(&segs),
+            "no slider should be drawn when too narrow"
+        );
+        assert!(
+            has_plain_containing(&segs, "1:23 / 5:18"),
+            "times kept as text"
+        );
+        assert!(has_plain_containing(&segs, "40%"), "volume kept");
+    }
+
+    #[test]
+    fn playbar_never_overflows_at_tiny_widths() {
+        // At pathologically narrow widths the playbar must still never exceed its area (the value may
+        // be truncated, but the bar is never allowed to overflow and corrupt the row).
+        for width in [0, 5, 8, 10, 11, 12, 13, 14] {
+            let segs = playbar_segments(width, true, 0.5, "1:23", "5:18", Some(40));
+            assert!(
+                playbar_width(&segs) <= width,
+                "playbar overflowed at tiny width {width}: {} cols",
+                playbar_width(&segs)
+            );
+        }
+    }
+
+    #[test]
+    fn playbar_keeps_volume_when_it_fits() {
+        // Once the volume block fits (>= icon + volume width), the level is kept fully visible even
+        // though the times have been dropped.
+        let segs = playbar_segments(16, true, 0.5, "1:23", "5:18", Some(40));
+        assert!(playbar_width(&segs) <= 16);
+        assert!(has_plain_containing(&segs, "40%"), "volume must survive");
+    }
+
+    #[test]
+    fn playbar_unknown_volume_stays_visible() {
+        let segs = playbar_segments(80, false, 0.0, "-", "-", None);
+        // Unknown volume renders the dash label, never a blank.
+        assert!(
+            has_plain_containing(&segs, "-"),
+            "unknown volume shows a dash"
+        );
+    }
+
     fn sample(is_playing: bool) -> NowPlaying {
         NowPlaying {
             is_playing,
@@ -832,10 +1172,14 @@ mod tests {
         assert_eq!(out.state, format!("{} Playing", theme::PLAY));
         assert!(out.title.contains("Song"));
         assert!(out.artist.contains("Artist"));
-        assert_eq!(out.progress_label, "1:00 / 3:00");
+        assert!(out.is_playing);
+        assert_eq!(out.elapsed_label, "1:00");
+        assert_eq!(out.total_label, "3:00");
         assert_eq!(out.ratio, 60_000.0 / 180_000.0);
+        assert_eq!(out.volume, Some(40));
         assert!(out.device.contains("MacBook Pro"));
-        assert!(out.device.contains("40%"));
+        // Volume now lives on the playbar, not the device line.
+        assert!(!out.device.contains("40%"));
     }
 
     #[test]
@@ -865,7 +1209,12 @@ mod tests {
         let out = render_lines(None, 0, 80, None);
         assert_eq!(out.state, "Nothing is playing");
         assert!(out.artist.is_empty());
+        assert!(!out.is_playing);
         assert_eq!(out.ratio, 0.0);
+        assert_eq!(out.volume, None);
+        // Times must be a visible dash, never an empty string (no silent blank).
+        assert_eq!(out.elapsed_label, "-");
+        assert_eq!(out.total_label, "-");
         // The hint must guide with real TUI keys, not a removed CLI command (issue #27).
         assert!(
             !out.title.contains("spotterm"),
