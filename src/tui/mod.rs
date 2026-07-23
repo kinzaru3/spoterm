@@ -13,6 +13,7 @@ mod detail;
 mod devices;
 mod playback;
 mod queue;
+mod rate_limit;
 mod search;
 mod view;
 
@@ -35,6 +36,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 use rspotify::AuthCodePkceSpotify;
+use rspotify::ClientError;
 
 use crate::auth;
 use crate::config::Config;
@@ -150,6 +152,15 @@ struct App {
     art_url: Option<String>,
     /// The playback queue shown in the display-only upper-right pane. Refreshed on the playback poll.
     queue: queue::QueueState,
+    /// When `Some`, a 429 cooldown is active until this instant: the playback poll, background loads,
+    /// and user operations are all gated until it passes so the client stops hammering Spotify. Armed
+    /// from a detected 429's `Retry-After` (or a local exponential backoff) and cleared on the next
+    /// successful poll. See [`rate_limit`].
+    rate_limited_until: Option<Instant>,
+    /// Consecutive 429 count, driving the local exponential backoff when the server sends no
+    /// `Retry-After`. Reset to 0 on any successful poll. Kept separate from `poll_failures` so rate
+    /// limiting (a transient, self-healing condition) never trips the auto-refresh-stopped path.
+    rate_limit_hits: u32,
 }
 
 /// `spotterm tui`: launch the Now Playing dashboard.
@@ -208,6 +219,8 @@ async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify, picker: Pick
         art: None,
         art_url: None,
         queue: queue::QueueState::default(),
+        rate_limited_until: None,
+        rate_limit_hits: 0,
     };
 
     // For auto-clearing the status line (detect changes and time them. Not stored on App; handled within this loop).
@@ -224,7 +237,13 @@ async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify, picker: Pick
         // (avoids retrying every 2 seconds on an invalid token).
         let forced = app.last_poll.is_none();
         let timer_due = app.last_poll.is_none_or(|t| t.elapsed() >= POLL_INTERVAL);
-        if forced || (timer_due && app.poll_failures < MAX_POLL_FAILURES) {
+        // A 429 cooldown gates every API call this iteration. While blocked we neither poll nor
+        // advance `last_poll`, so `timer_due` stays satisfied and the very next iteration after the
+        // cooldown lifts polls immediately (明け即 poll). `rate_limit_blocked` also refreshes the
+        // countdown on the status line so it ticks down (no silent wait). Rate limiting is tracked
+        // apart from `poll_failures`, so a cooldown never counts toward the auto-refresh-stopped cap.
+        let blocked = rate_limit_blocked(&mut app);
+        if !blocked && (forced || (timer_due && app.poll_failures < MAX_POLL_FAILURES)) {
             playback::poll_playback(&mut app).await;
             // Poll the queue only while its pane is on screen (#38), reading the *previous* frame's
             // visibility (this poll runs before this iteration's `draw`). A hidden→visible flip is
@@ -266,18 +285,23 @@ async fn run_loop(terminal: &mut Term, client: AuthCodePkceSpotify, picker: Pick
         }
         prev_queue_visible = app.queue_visible;
 
-        // Load the library once, *after* the first frame is drawn, so the dashboard (with the
-        // "Loading…" library note) appears immediately instead of the whole UI blocking on the
-        // multi-call `All` fetch. The fetch is concurrent (see `browse::fetch_all`), so this is one
-        // round-trip, comparable to the playback poll above.
-        browse::ensure_library_loaded(&mut app).await;
+        // Background loads are also gated by an active 429 cooldown: they issue their own API calls,
+        // so running them while rate limited would keep the burst alive. They are one-shot/cached, so
+        // pausing them for a short cooldown only defers the fetch by a few seconds.
+        if !blocked {
+            // Load the library once, *after* the first frame is drawn, so the dashboard (with the
+            // "Loading…" library note) appears immediately instead of the whole UI blocking on the
+            // multi-call `All` fetch. The fetch is concurrent (see `browse::fetch_all`), so this is one
+            // round-trip, comparable to the playback poll above.
+            browse::ensure_library_loaded(&mut app).await;
 
-        // Load the detail for the current library selection (only when the selection changed; cached
-        // per item). Runs after the library load so there is a selection to describe.
-        detail::ensure_detail_loaded(&mut app).await;
+            // Load the detail for the current library selection (only when the selection changed; cached
+            // per item). Runs after the library load so there is a selection to describe.
+            detail::ensure_detail_loaded(&mut app).await;
 
-        // In search mode, load the highlight detail for the selected result (same per-URI cache).
-        search::ensure_search_detail_loaded(&mut app).await;
+            // In search mode, load the highlight detail for the selected result (same per-URI cache).
+            search::ensure_search_detail_loaded(&mut app).await;
+        }
 
         // Wait for a key up to TICK (if none, redraw to advance progress).
         // On Windows it also fires on release, so handle presses only.
@@ -378,30 +402,100 @@ async fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
 }
 
 /// Refresh the retained client's token if needed. On failure, show it on the status line and return `false`.
+/// A 429 cooldown is checked first: while blocked, the operation is refused (the countdown is shown)
+/// so user actions do not add to the burst.
 async fn ensure_ready(app: &mut App) -> bool {
+    if rate_limit_blocked(app) {
+        return false;
+    }
     match auth::ensure_fresh_token(&app.client).await {
         Ok(()) => true,
         Err(e) => {
-            app.status = format!("{} {e}", theme::WARN);
+            // A 429 from the token refresh itself must also arm the cooldown; otherwise every keypress
+            // would keep re-refreshing without backing off and feed the burst.
+            if !note_if_rate_limited(app, &e) {
+                app.status = format!("{} {e}", theme::WARN);
+            }
             false
         }
     }
 }
 
-/// Reflect the operation result on the status line, and on success schedule an immediate poll.
-fn finish<E: std::fmt::Display>(app: &mut App, res: Result<(), E>, ok: &str) {
+/// Reflect the operation result on the status line, and on success schedule an immediate poll. A
+/// `429` in the error is intercepted and armed as a cooldown rather than shown as a generic failure.
+fn finish(app: &mut App, res: Result<(), ClientError>, ok: &str) {
     match res {
         Ok(()) => {
+            clear_rate_limit(app); // a call the server accepted proves the budget has recovered
             app.status = ok.to_string();
             app.last_poll = None; // Reflect the change on screen quickly
         }
         Err(e) => {
-            app.status = format!(
-                "{} operation failed: {e} (press d to select and activate a device)",
-                theme::WARN
-            );
+            if !note_if_rate_limited_client(app, &e) {
+                app.status = format!(
+                    "{} operation failed: {e} (press d to select and activate a device)",
+                    theme::WARN
+                );
+            }
         }
     }
+}
+
+/// Record a detected 429: bump the consecutive-hit count, arm the cooldown from the server
+/// `Retry-After` (or the local exponential backoff), and show the countdown. Deliberately does not
+/// touch `poll_failures` — rate limiting is a distinct, self-healing condition from the
+/// auth/network failures that stop auto-refresh.
+fn note_rate_limit(app: &mut App, hit: rate_limit::RateLimitHit) {
+    app.rate_limit_hits = app.rate_limit_hits.saturating_add(1);
+    let secs = rate_limit::wait_secs(hit.retry_after, app.rate_limit_hits);
+    app.rate_limited_until = Some(Instant::now() + Duration::from_secs(secs));
+    app.status = rate_limit::rate_limit_status(secs);
+}
+
+/// Fold rate-limit handling into an existing `anyhow` error arm: if `err` carries a 429, arm the
+/// cooldown and return `true` (the caller then returns without showing its generic error). Returns
+/// `false` for any non-429 error, which the caller reports as before. Used by every API call site so
+/// the *first* 429 from any path — not just the poll — starts the backoff.
+fn note_if_rate_limited(app: &mut App, err: &anyhow::Error) -> bool {
+    match rate_limit::detect(err) {
+        Some(hit) => {
+            note_rate_limit(app, hit);
+            true
+        }
+        None => false,
+    }
+}
+
+/// [`note_if_rate_limited`] for a concrete `ClientError` (the control-op paths that keep the typed
+/// error rather than wrapping it in `anyhow`).
+fn note_if_rate_limited_client(app: &mut App, err: &ClientError) -> bool {
+    match rate_limit::detect_client_error(err) {
+        Some(hit) => {
+            note_rate_limit(app, hit);
+            true
+        }
+        None => false,
+    }
+}
+
+/// If a 429 cooldown is active, refresh the countdown status and return `true` (the caller aborts
+/// its API call). Returns `false` when not blocked. Shown seconds are floored but never below 1
+/// while still blocked, so the countdown never displays a misleading `0s`.
+fn rate_limit_blocked(app: &mut App) -> bool {
+    match rate_limit::remaining(app.rate_limited_until, Instant::now()) {
+        Some(d) => {
+            app.status = rate_limit::rate_limit_status(d.as_secs().max(1));
+            true
+        }
+        None => false,
+    }
+}
+
+/// End any 429 cooldown and reset the consecutive-hit count. Called on a successful poll — proof the
+/// budget has recovered.
+fn clear_rate_limit(app: &mut App) {
+    app.rate_limited_until = None;
+    app.rate_limit_hits = 0;
 }
 
 // ---- Terminal control -------------------------------------------------------

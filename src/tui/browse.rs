@@ -458,12 +458,22 @@ pub(super) async fn load_library(app: &mut App, tab: BrowseTab) {
         app.library.set_rows(loaded.rows, message);
         return;
     }
+    // A 429 cooldown gates the network fetch (the cache path above is already served without a call).
+    // This entry is reached straight from the key handler (`[`/`]`/`r`), not the run-loop gate, so it
+    // needs its own guard to keep tab-switch spam from feeding the burst.
+    if super::rate_limit_blocked(app) {
+        return;
+    }
     match fetch(&app.client, tab).await {
         Ok(loaded) => {
             // Cache the whole load (rows + note); the clone is cheap for a few dozen small structs.
             app.browse_cache.set(tab, loaded.clone());
             let message = library_message(&loaded.rows, loaded.note, tab);
             app.library.set_rows(loaded.rows, message);
+        }
+        Err(e) if super::note_if_rate_limited(app, &e) => {
+            // A 429 armed the cooldown; leave the pane's last-known rows in place (the countdown is
+            // on the status line) rather than replacing them with a fetch-error note.
         }
         Err(e) => {
             // `{e:#}` shows anyhow's full cause chain (e.g. the 403 behind "failed to fetch followed
@@ -493,6 +503,11 @@ fn library_message(rows: &[LibraryRow], note: Option<String>, tab: BrowseTab) ->
 /// never overwritten by a transient play result that would then go stale). A header selection plays
 /// nothing (headers are never selectable, so this only happens on an empty list, already messaged).
 pub(super) async fn library_play(app: &mut App) {
+    // Refuse to start playback while a 429 cooldown is active (shows the countdown) — this entry does
+    // not go through `ensure_ready`, so it needs its own gate to avoid adding to the burst.
+    if super::rate_limit_blocked(app) {
+        return;
+    }
     let Some(target) = app.library.selected_item().map(|it| it.target.clone()) else {
         return;
     };
@@ -502,9 +517,11 @@ pub(super) async fn library_play(app: &mut App) {
             app.last_poll = None;
         }
         Err(e) => {
-            // `{e:#}` surfaces anyhow's full cause chain, so playback failures name the real reason
-            // (no active device, parse error, etc.), not just the outermost context.
-            app.status = format!("{} playback failed: {e:#}", theme::WARN);
+            if !super::note_if_rate_limited(app, &e) {
+                // `{e:#}` surfaces anyhow's full cause chain, so playback failures name the real reason
+                // (no active device, parse error, etc.), not just the outermost context.
+                app.status = format!("{} playback failed: {e:#}", theme::WARN);
+            }
         }
     }
 }

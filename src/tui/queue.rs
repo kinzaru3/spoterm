@@ -65,6 +65,9 @@ impl Default for QueueState {
 pub(super) async fn poll_queue(app: &mut App) {
     match fetch_queue(app).await {
         Ok(state) => app.queue = state,
+        // A 429 arms the shared cooldown (which then gates the next queue poll) instead of counting
+        // toward the queue's own failure escalation — this recurring poll is otherwise a burst source.
+        Err(e) if super::note_if_rate_limited(app, &e) => {}
         // `{e:#}` includes the anyhow context chain (the bare `{e}` would show only the top wrapper).
         Err(e) => degrade_on_failure(&mut app.queue, format!("{e:#}")),
     }
